@@ -44,6 +44,13 @@ typedef enum {
 }im_ihdr_color_types;
 
 typedef enum {
+    UNCOMPRESSED,
+    FIXED_HUFFMAN,
+    DYNAMIC_HUFFMAN,
+    RESERVED
+}im_compression_types;
+
+typedef enum {
     // IHDR has to be the first chunk in the file.
     CHUNK_IHDR = STR_TO_UINT('I','H','D','R'),
 
@@ -72,7 +79,7 @@ typedef enum {
     CHUNK_gAMA = STR_TO_UINT('g','A','M','A'),
 
     // IEND has to appear after IDAT, and has to be the last chunk in the file.
-    CHUNK_IEND = STR_TO_UINT('I','E','N','D'),
+    CHUNK_IEND = STR_TO_UINT('I','E','N','D')
 }im_chunk_types;
 
 typedef int im_bool;
@@ -119,7 +126,7 @@ typedef struct{
     uint8_t hour;
     uint8_t minute;
     uint8_t second;
-    void *png_pixels; // the actual pixels of the image, uncompressed.
+    char *png_pixels; // the actual pixels of the image, uncompressed.
 }png_info;
 
 static char *im__read_entire_file(const char *file_path, size_t *bytes_read) {
@@ -420,24 +427,10 @@ static void im__parse_chunk_IDAT(png_info *info) {
     printf("%.*s\n", PNG_CHUNK_TYPE_LEN, IDAT_chunk_type);
 
     if(info->compression_method == 0) {
-        char *compressed_data = malloc(IDAT_data_len);
-        im__read_bytes(info, compressed_data, IDAT_data_len);
         if(info->idat_count == 0) {
 
-            uint8_t comp_method_and_flags = compressed_data[0];
-            uint8_t comp_method = comp_method_and_flags & 0x0F;   // bits 0 - 3
-            uint8_t comp_info  = (comp_method_and_flags >> 4) & 0x0F; // bit 4 - 8
 
-            uint8_t flags = compressed_data[1];
-            uint8_t check_bits = flags & 0x1F;         // bits 0-4
-            uint8_t preset_dict_flag = (flags >> 5) & 1;  // bit 5
-            uint8_t compression_level = (flags >> 6) & 3; // bits 6-7
-
-            printf("Compression method: %d (should be 8 = DEFLATE)\n", comp_method);
-            printf("Window size: %d KB\n", 1 << (comp_info + 8));
-            printf("Flags byte: 0x%02X\n", flags);
             info->idat_count++;;
-            printf("%lu", sizeof(comp_method_and_flags + flags));
 
             // we skip the first two bytes of the first IDAT chunk because the first two bytes don't contain any compressed data.
         }
@@ -545,6 +538,27 @@ static char* im__peek_next_chunk(png_info *info, char *current_chunk) {
     return current_chunk + PNG_CHUNK_DATA_LEN + PNG_CHUNK_TYPE_LEN + data_length + PNG_CHUNK_CRC_LEN;
 }
 
+typedef struct {
+    uint8_t *data;
+    size_t bitpos; // bit offset from start
+} im__bitstream;
+
+uint32_t read_bits(im__bitstream *bs, int n) {
+    uint32_t val = 0;
+    for (int i = 0; i < n; i++) {
+        size_t byte_index = bs->bitpos / 8;
+        int bit_index = bs->bitpos % 8;
+        val |= ((bs->data[byte_index] >> bit_index) & 1) << i;
+        bs->bitpos++;
+    }
+    return val;
+}
+
+static inline void align_next_byte(im__bitstream *bs) {
+    if (bs->bitpos % 8 != 0)
+        bs->bitpos += 8 - (bs->bitpos % 8);
+}
+
 static char *decompress_png(png_info *info, char *current_IDAT_chunk) {
 
     uint32_t comp_data_size = 0;
@@ -566,8 +580,8 @@ static char *decompress_png(png_info *info, char *current_IDAT_chunk) {
         idat_chunk_count++;
     }
 
-    char *concatenated_data = (char*)malloc(comp_data_size);
-    if (!concatenated_data) return NULL;
+    char *compressed_data = (char*)malloc(comp_data_size);
+    if (!compressed_data) return NULL;
 
     size_t offset = 0;
     uint32_t current_chunk_data_len = 0;
@@ -579,15 +593,77 @@ static char *decompress_png(png_info *info, char *current_IDAT_chunk) {
         memcpy(&current_chunk_data_len, current_IDAT_chunk, PNG_CHUNK_DATA_LEN);
         im__reverse_bytes(&current_chunk_data_len, PNG_CHUNK_DATA_LEN);
 
-        memcpy(concatenated_data + offset, current_IDAT_chunk + PNG_CHUNK_DATA_LEN + PNG_CHUNK_TYPE_LEN, current_chunk_data_len);
+        memcpy(compressed_data + offset, current_IDAT_chunk + PNG_CHUNK_DATA_LEN + PNG_CHUNK_TYPE_LEN, current_chunk_data_len);
         offset += current_chunk_data_len;
 
         current_IDAT_chunk += PNG_CHUNK_DATA_LEN + PNG_CHUNK_TYPE_LEN + current_chunk_data_len + PNG_CHUNK_CRC_LEN;
     }
 
-    size_t bytes_per_scanline = im__ceil(info->width * info->channel_count * info->bits_per_channel, 8);
-    size_t image_size_after_decompression = info->height * (bytes_per_scanline + 1); // +1 per scanline for filter byte
-    info->png_pixels = malloc(image_size_after_decompression);
+    // this contains the compression method in the lower nibble, and the compression window size in the higher nibble.
+    char *zlib_header = compressed_data;
+    compressed_data += 2; // skip zlib header.
+    uint8_t cmf = zlib_header[0];
+    uint8_t comp_method = cmf & 0x0F;   // bits 0 - 3 | HAS TO BE 8 BECAUSE .PNG SPEC ONLY SUPPORTS DEFLATE.
+    uint8_t comp_window_size_bits  = (cmf >> 4) & 0x0F; // bit 4 - 8
+    uint8_t comp_window_size = 1 << (comp_window_size_bits + 8); // window = 1 << (8 + bits)
+
+    uint8_t flg = zlib_header[1];
+    uint8_t check_bits = flg & 0x1F;         // bits 0-4 | Used for integrity check
+    uint8_t preset_dict_flag = (flg >> 5) & 1;  // bit 5 | HAS TO BE 0 BECAUSE .PNG SPEC SAID SO.
+    uint8_t compression_level = (flg >> 6) & 3; // bits 6-7 | 0 - 3 Compression level hints. These don't matter when decompressing.
+
+    printf("Compression method: %d (should be 8 = DEFLATE)\n", comp_method);
+    printf("Compression window size: %d KB\n", comp_window_size);
+    printf("check_bits: %d\n", check_bits);
+    printf("preset_dict_flag: %d\n", preset_dict_flag);
+    printf("Compression level: %d\n", compression_level);
+
+    printf("%lu\n", sizeof(cmf + flg));
+
+    if (((cmf << 8) + flg) % 31 == 0) {
+        printf("Info: Integrity check successful!\ndecompressing...\n");
+        size_t bytes_per_scanline = im__ceil(info->width * info->channel_count * info->bits_per_channel, 8);
+        size_t image_size_after_decompression = info->height * (bytes_per_scanline + 1); // +1 per scanline for filter byte
+        info->png_pixels = malloc(image_size_after_decompression);
+        uint8_t is_last_block, block_type;
+        size_t offset = 0;
+        im__bitstream bs = { (uint8_t*)compressed_data, 0 };
+        do {
+            is_last_block = read_bits(&bs, 1);
+            block_type = read_bits(&bs, 2);
+            printf("block_type %d, is_last_block %d\n", block_type, is_last_block);
+            switch(block_type) {
+                case UNCOMPRESSED: {
+                    printf("Copying uncompressed block!\n");
+                    align_next_byte(&bs);
+
+                    uint16_t len  = read_bits(&bs, 16);
+                    uint16_t nlen = read_bits(&bs, 16);
+
+                    if ((len ^ nlen) != 0xFFFF) {
+                        fprintf(stderr, "Error: Corrupted stored block!\n");
+                    }
+                    for (uint16_t i = 0; i < len; i++) {
+                        info->png_pixels[offset++] = (uint8_t)read_bits(&bs, 8);
+                    }
+                    break;
+                }
+                case FIXED_HUFFMAN: {
+                    break;
+                }
+                case DYNAMIC_HUFFMAN: {
+                    break;
+                }
+                case RESERVED: {
+                    fprintf(stderr, "Error: Encountered reserved (invalid) block type!\n");
+                    break;
+                }
+            }
+        } while(!is_last_block);
+
+    } else {
+        fprintf(stderr, "Error: Integrity check failed.\n");
+    }
 
     return info->png_pixels;
 }
@@ -668,7 +744,7 @@ int main(int argc, char **argv) {
             case CHUNK_IDAT: {
                 char *png_pixels = decompress_png(&info, next_chunk_type - PNG_CHUNK_DATA_LEN);
                 //im__parse_chunk_IDAT(&info);
-                for(int i = 0; i < idat_chunk_count; i++) {
+                for(int i = 0; i < 4; i++) {
                     skip_chunk(&info);
                 }
                 printf("-----------------------------\n");
