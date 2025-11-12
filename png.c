@@ -119,7 +119,7 @@ typedef struct{
     uint8_t hour;
     uint8_t minute;
     uint8_t second;
-    void *image_data;
+    void *png_pixels; // the actual pixels of the image, uncompressed.
 }png_info;
 
 static char *im__read_entire_file(const char *file_path, size_t *bytes_read) {
@@ -409,10 +409,6 @@ static void im__parse_chunk_tIME(png_info *info) {
     im__read_bytes_and_reverse(info, &crc, PNG_CHUNK_CRC_LEN);
 }
 
-static void *decompress_png(void *compressed_data_input_buffer, void *uncompressed_data_output_buffer) {
-    return NULL;
-}
-
 static void im__parse_chunk_IDAT(png_info *info) {
     uint32_t IDAT_data_len = 0;
     im__read_bytes_and_reverse(info, &IDAT_data_len, PNG_CHUNK_DATA_LEN);
@@ -443,14 +439,7 @@ static void im__parse_chunk_IDAT(png_info *info) {
             info->idat_count++;;
             printf("%lu", sizeof(comp_method_and_flags + flags));
 
-            size_t bytes_per_scanline = im__ceil(info->width * info->channel_count * info->bits_per_channel, 8);
-            size_t image_size_after_decompression = info->height * (bytes_per_scanline + 1); // +1 per scanline for filter byte
-
-            info->image_data = malloc(image_size_after_decompression);
             // we skip the first two bytes of the first IDAT chunk because the first two bytes don't contain any compressed data.
-            decompress_png(compressed_data + 2, info->image_data);
-        } else {
-            decompress_png(compressed_data, info->image_data);
         }
     }
 
@@ -556,11 +545,15 @@ static char* im__peek_next_chunk(png_info *info, char *current_chunk) {
     return current_chunk + PNG_CHUNK_DATA_LEN + PNG_CHUNK_TYPE_LEN + data_length + PNG_CHUNK_CRC_LEN;
 }
 
-static size_t find_size_of_compressed_data_and_IDAT_chunk_count(png_info *info, char *current_IDAT_chunk, size_t *idat_chunk_count) {
+static char *decompress_png(png_info *info, char *current_IDAT_chunk) {
+
     uint32_t comp_data_size = 0;
     uint32_t tmp = 0;
     
-    *idat_chunk_count = 0;
+    size_t idat_chunk_count = 0;
+    char *start = current_IDAT_chunk;
+
+    // find the total size of the compressed data
     while(*(uint32_t*)(current_IDAT_chunk + PNG_CHUNK_DATA_LEN) == CHUNK_IDAT) {
 
         memcpy(&tmp, current_IDAT_chunk, PNG_CHUNK_DATA_LEN);
@@ -570,18 +563,18 @@ static size_t find_size_of_compressed_data_and_IDAT_chunk_count(png_info *info, 
         comp_data_size += tmp;
         current_IDAT_chunk = im__peek_next_chunk(info, current_IDAT_chunk);
         printf("TOTAL SIZE OF COMPRESSED DATA: %d\n", comp_data_size);
-        (*idat_chunk_count)++;
+        idat_chunk_count++;
     }
-    return comp_data_size;
-}
 
-static char *concatenate_data_fields_of_all_IDAT_chunks(char *current_IDAT_chunk, size_t comp_data_size) {
     char *concatenated_data = (char*)malloc(comp_data_size);
     if (!concatenated_data) return NULL;
 
     size_t offset = 0;
     uint32_t current_chunk_data_len = 0;
 
+    // concatenate the data sections of all the IDAT chunks together.
+    // we need to do this in order to decompress the data.
+    current_IDAT_chunk = start;
     while (*(uint32_t*)(current_IDAT_chunk + 4) == CHUNK_IDAT) {
         memcpy(&current_chunk_data_len, current_IDAT_chunk, PNG_CHUNK_DATA_LEN);
         im__reverse_bytes(&current_chunk_data_len, PNG_CHUNK_DATA_LEN);
@@ -592,7 +585,11 @@ static char *concatenate_data_fields_of_all_IDAT_chunks(char *current_IDAT_chunk
         current_IDAT_chunk += PNG_CHUNK_DATA_LEN + PNG_CHUNK_TYPE_LEN + current_chunk_data_len + PNG_CHUNK_CRC_LEN;
     }
 
-    return concatenated_data;
+    size_t bytes_per_scanline = im__ceil(info->width * info->channel_count * info->bits_per_channel, 8);
+    size_t image_size_after_decompression = info->height * (bytes_per_scanline + 1); // +1 per scanline for filter byte
+    info->png_pixels = malloc(image_size_after_decompression);
+
+    return info->png_pixels;
 }
 
 int main(int argc, char **argv) {
@@ -669,11 +666,8 @@ int main(int argc, char **argv) {
                 skip_chunk(&info);
                 break;
             case CHUNK_IDAT: {
-                size_t idat_chunk_count = 0;
-                size_t comp_data_size = find_size_of_compressed_data_and_IDAT_chunk_count(&info, next_chunk_type - 4, &idat_chunk_count);
-                char *concatenated_compressed_data = concatenate_data_fields_of_all_IDAT_chunks(next_chunk_type - 4, comp_data_size);
-                decompress_png(concatenated_compressed_data, png_pixels);
-                im__parse_chunk_IDAT(&info);
+                char *png_pixels = decompress_png(&info, next_chunk_type - PNG_CHUNK_DATA_LEN);
+                //im__parse_chunk_IDAT(&info);
                 for(int i = 0; i < idat_chunk_count; i++) {
                     skip_chunk(&info);
                 }
