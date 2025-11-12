@@ -79,13 +79,13 @@ typedef int im_bool;
 #define IM_TRUE 1
 #define IM_FALSE 0
 typedef struct{
-    char* png_file;
+    char *png_file;
     size_t file_size;
     size_t bytes_read;
     uint32_t width;
     uint32_t height;
-    uint8_t channel_count;
-    uint8_t bit_depth;
+    uint8_t channel_count; // channels are called "samples" in the spec, but that's stupid, so I won't call them samples.
+    uint8_t bits_per_channel;
     uint8_t color_type;
     uint8_t compression_method;
     uint8_t filter_method;
@@ -119,6 +119,7 @@ typedef struct{
     uint8_t hour;
     uint8_t minute;
     uint8_t second;
+    void *image_data;
 }png_info;
 
 static char *im__read_entire_file(const char *file_path, size_t *bytes_read) {
@@ -174,6 +175,7 @@ static void im__read_bytes(png_info *info, void* buf, const size_t bytes_to_read
     }
 }
 
+
 static void im__read_bytes_and_reverse(png_info *info, void* buf, const size_t bytes_to_read) {
     if(info->png_file + info->bytes_read < info->png_file + info->file_size) {
         memcpy(buf, info->png_file + info->bytes_read, bytes_to_read);
@@ -182,6 +184,10 @@ static void im__read_bytes_and_reverse(png_info *info, void* buf, const size_t b
     } else {
         fprintf(stderr, "Error: %s(): tried to read bytes past end of file, not going to read.", __func__);
     }
+}
+
+size_t im__ceil(size_t x, size_t y) {
+    return (x + y - 1) / y;
 }
 
 static void im__parse_chunk_IHDR(png_info *info) {
@@ -201,7 +207,7 @@ static void im__parse_chunk_IHDR(png_info *info) {
     im__read_bytes_and_reverse(info, &info->width, 4);
     im__read_bytes_and_reverse(info, &info->height, 4);
 
-    im__read_bytes_and_reverse(info, &info->bit_depth, 1);
+    im__read_bytes_and_reverse(info, &info->bits_per_channel, 1);
     im__read_bytes_and_reverse(info, &info->color_type, 1);
     im__read_bytes_and_reverse(info, &info->compression_method, 1);
     im__read_bytes_and_reverse(info, &info->filter_method, 1);
@@ -217,18 +223,18 @@ static void im__parse_chunk_IHDR(png_info *info) {
         IM_ERR("Invalid color type. Expected 0, 2, 3, 4, or 6, got: %u Corrupt PNG.", info->color_type);
     switch(info->color_type) {
         case 0:
-            if(info->bit_depth !=1 && info->bit_depth !=2 && info->bit_depth !=4 && info->bit_depth !=8 && info->bit_depth !=16)
-                IM_ERR("Invalid bit depth for color type 0. Expected 1, 2, 4, 8 or 16, got: %u", info->bit_depth);
+            if(info->bits_per_channel !=1 && info->bits_per_channel !=2 && info->bits_per_channel !=4 && info->bits_per_channel !=8 && info->bits_per_channel !=16)
+                IM_ERR("Invalid bit depth for color type 0. Expected 1, 2, 4, 8 or 16, got: %u", info->bits_per_channel);
             break;
         case 3:
-            if(info->bit_depth !=1 && info->bit_depth !=2 && info->bit_depth !=4 && info->bit_depth !=8)
-                IM_ERR("Invalid bit depth for color type 3. Expected 1, 2, 4 or 8, got: %u", info->bit_depth);
+            if(info->bits_per_channel !=1 && info->bits_per_channel !=2 && info->bits_per_channel !=4 && info->bits_per_channel !=8)
+                IM_ERR("Invalid bit depth for color type 3. Expected 1, 2, 4 or 8, got: %u", info->bits_per_channel);
             break;
         case 2:
         case 4:
         case 6:
-            if(info->bit_depth != 8 && info->bit_depth != 16)
-                IM_ERR("Invalid bit depth for color type 6. Expected 8 or 16, got: %u", info->bit_depth);
+            if(info->bits_per_channel != 8 && info->bits_per_channel != 16)
+                IM_ERR("Invalid bit depth for color type 6. Expected 8 or 16, got: %u", info->bits_per_channel);
             break;
     }
     if(info->compression_method !=0)
@@ -241,7 +247,7 @@ static void im__parse_chunk_IHDR(png_info *info) {
 
     printf("width: %d\n", info->width);
     printf("height: %d\n", info->height);
-    printf("bits_per_channel: %d\n", info->bit_depth);
+    printf("bits_per_channel: %d\n", info->bits_per_channel);
     printf("color_type: %d\n", info->color_type);
     printf("compression_method: %d\n", info->compression_method);
     printf("filter_method: %d\n", info->filter_method);
@@ -403,7 +409,8 @@ static void im__parse_chunk_tIME(png_info *info) {
     im__read_bytes_and_reverse(info, &crc, PNG_CHUNK_CRC_LEN);
 }
 
-static void decompress_png(png_info *info) {
+static void *decompress_png(void *compressed_data_input_buffer, void *uncompressed_data_output_buffer) {
+    return NULL;
 }
 
 static void im__parse_chunk_IDAT(png_info *info) {
@@ -420,8 +427,8 @@ static void im__parse_chunk_IDAT(png_info *info) {
         char *compressed_data = malloc(IDAT_data_len);
         im__read_bytes(info, compressed_data, IDAT_data_len);
         if(info->idat_count == 0) {
-            uint8_t comp_method_and_flags = compressed_data[0];
 
+            uint8_t comp_method_and_flags = compressed_data[0];
             uint8_t comp_method = comp_method_and_flags & 0x0F;   // bits 0 - 3
             uint8_t comp_info  = (comp_method_and_flags >> 4) & 0x0F; // bit 4 - 8
 
@@ -434,6 +441,16 @@ static void im__parse_chunk_IDAT(png_info *info) {
             printf("Window size: %d KB\n", 1 << (comp_info + 8));
             printf("Flags byte: 0x%02X\n", flags);
             info->idat_count++;;
+            printf("%lu", sizeof(comp_method_and_flags + flags));
+
+            size_t bytes_per_scanline = im__ceil(info->width * info->channel_count * info->bits_per_channel, 8);
+            size_t image_size_after_decompression = info->height * (bytes_per_scanline + 1); // +1 per scanline for filter byte
+
+            info->image_data = malloc(image_size_after_decompression);
+            // we skip the first two bytes of the first IDAT chunk because the first two bytes don't contain any compressed data.
+            decompress_png(compressed_data + 2, info->image_data);
+        } else {
+            decompress_png(compressed_data, info->image_data);
         }
     }
 
@@ -516,10 +533,66 @@ static void skip_chunk(png_info *info) {
     im__reverse_bytes(&length_be, 4);
 
     // Skip the chunk type (4 bytes), chunk data (length_be bytes), and CRC (4 bytes)
-    size_t bytes_to_skip = 4 + length_be + 4;
+    size_t bytes_to_skip = PNG_CHUNK_TYPE_LEN + length_be + PNG_CHUNK_CRC_LEN;
 
     // Advance the offset
     info->bytes_read += bytes_to_skip;
+}
+
+static void im__peek_bytes(png_info *info, void* buf, char *offset, const size_t bytes_to_read) {
+    if(offset < info->png_file + info->file_size) {
+        memcpy(buf, offset, bytes_to_read);
+    } else {
+        fprintf(stderr, "Error: %s(): tried to read bytes past end of file, not going to read.", __func__);
+    }
+}
+
+static char* im__peek_next_chunk(png_info *info, char *current_chunk) {
+    uint32_t data_length = 0;
+    im__peek_bytes(info, &data_length, current_chunk, PNG_CHUNK_DATA_LEN);
+    im__reverse_bytes(&data_length, PNG_CHUNK_DATA_LEN);
+    printf("DATA LENGTH: %d\n", data_length);
+
+    return current_chunk + PNG_CHUNK_DATA_LEN + PNG_CHUNK_TYPE_LEN + data_length + PNG_CHUNK_CRC_LEN;
+}
+
+static size_t find_size_of_compressed_data_and_IDAT_chunk_count(png_info *info, char *current_IDAT_chunk, size_t *idat_chunk_count) {
+    uint32_t comp_data_size = 0;
+    uint32_t tmp = 0;
+    
+    *idat_chunk_count = 0;
+    while(*(uint32_t*)(current_IDAT_chunk + PNG_CHUNK_DATA_LEN) == CHUNK_IDAT) {
+
+        memcpy(&tmp, current_IDAT_chunk, PNG_CHUNK_DATA_LEN);
+        im__reverse_bytes(&tmp, PNG_CHUNK_DATA_LEN);
+        printf(" THE FUCKING DATA LENGTH: %d\n", tmp);
+
+        comp_data_size += tmp;
+        current_IDAT_chunk = im__peek_next_chunk(info, current_IDAT_chunk);
+        printf("TOTAL SIZE OF COMPRESSED DATA: %d\n", comp_data_size);
+        (*idat_chunk_count)++;
+    }
+    return comp_data_size;
+}
+
+static char *concatenate_data_fields_of_all_IDAT_chunks(char *current_IDAT_chunk, size_t comp_data_size) {
+    char *concatenated_data = (char*)malloc(comp_data_size);
+    if (!concatenated_data) return NULL;
+
+    size_t offset = 0;
+    uint32_t current_chunk_data_len = 0;
+
+    while (*(uint32_t*)(current_IDAT_chunk + 4) == CHUNK_IDAT) {
+        memcpy(&current_chunk_data_len, current_IDAT_chunk, PNG_CHUNK_DATA_LEN);
+        im__reverse_bytes(&current_chunk_data_len, PNG_CHUNK_DATA_LEN);
+
+        memcpy(concatenated_data + offset, current_IDAT_chunk + PNG_CHUNK_DATA_LEN + PNG_CHUNK_TYPE_LEN, current_chunk_data_len);
+        offset += current_chunk_data_len;
+
+        current_IDAT_chunk += PNG_CHUNK_DATA_LEN + PNG_CHUNK_TYPE_LEN + current_chunk_data_len + PNG_CHUNK_CRC_LEN;
+    }
+
+    return concatenated_data;
 }
 
 int main(int argc, char **argv) {
@@ -595,10 +668,18 @@ int main(int argc, char **argv) {
             case CHUNK_sPLT:
                 skip_chunk(&info);
                 break;
-            case CHUNK_IDAT:
+            case CHUNK_IDAT: {
+                size_t idat_chunk_count = 0;
+                size_t comp_data_size = find_size_of_compressed_data_and_IDAT_chunk_count(&info, next_chunk_type - 4, &idat_chunk_count);
+                char *concatenated_compressed_data = concatenate_data_fields_of_all_IDAT_chunks(next_chunk_type - 4, comp_data_size);
+                decompress_png(concatenated_compressed_data, png_pixels);
                 im__parse_chunk_IDAT(&info);
+                for(int i = 0; i < idat_chunk_count; i++) {
+                    skip_chunk(&info);
+                }
                 printf("-----------------------------\n");
                 break;
+            }
             case CHUNK_iTXt:
                 skip_chunk(&info);
                 break;
