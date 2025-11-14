@@ -13,19 +13,31 @@
 #define PNG_CHUNK_CRC_LEN 4
 
 #ifndef IM_NO_ERRORS
-#define IM_PRINT(...) \
+#define IM_ERROR(...) \
     do { \
-        printf("Error: "); \
+        printf("[ERROR] "); \
         printf(__VA_ARGS__); \
         printf("Corrupt Png."); \
         printf("\n"); \
     } while(0)
-#define IM_ERR(...) IM_PRINT(__VA_ARGS__)
+#define IM_ERR(...) IM_ERROR(__VA_ARGS__)
 #else
-#define IM_PRINT(...) ((void)0)
+#define IM_ERROR(...) ((void)0)
 #define IM_ERR(...)((void)0)
 #endif
 
+#ifndef IM_NO_INFO
+#define IM_INFORMATION(...) \
+    do { \
+        printf("[INFO] "); \
+        printf(__VA_ARGS__); \
+        printf("\n"); \
+    } while(0)
+#define IM_INFO(...) IM_INFORMATION(__VA_ARGS__)
+#else
+#define IM_INFO(...) ((void)0)
+#define IM_INFORMATION(...)((void)0)
+#endif
 
 #define STR_TO_UINT(a,b,c,d) \
     (((uint32_t)(a))       | \
@@ -33,7 +45,10 @@
      ((uint32_t)(c) << 16) | \
      ((uint32_t)(d) << 24))
 
-uint8_t png_sig[PNG_SIG_LEN] = {137, 80, 78, 71, 13, 10, 26, 10};
+typedef int im_bool;
+#define IM_TRUE 1
+#define IM_FALSE 0
+
 
 typedef enum {
     GRAYSCALE = 0,
@@ -82,9 +97,7 @@ typedef enum {
     CHUNK_IEND = STR_TO_UINT('I','E','N','D')
 }im_chunk_types;
 
-typedef int im_bool;
-#define IM_TRUE 1
-#define IM_FALSE 0
+
 typedef struct{
     char *png_file;
     size_t file_size;
@@ -128,6 +141,22 @@ typedef struct{
     uint8_t second;
     char *png_pixels; // the actual pixels of the image, uncompressed.
 }png_info;
+
+uint8_t png_sig[PNG_SIG_LEN] = {137, 80, 78, 71, 13, 10, 26, 10};
+
+#define FIXED_LITERAL_COUNT 288
+#define FIXED_DISTANCE_COUNT 32
+
+static const uint8_t fixed_literal_lengths[FIXED_LITERAL_COUNT] = {
+    [0 ... 143] = 8,
+    [144 ... 255] = 9,
+    [256 ... 279] = 7,
+    [280 ... 287] = 8
+};
+
+static const uint8_t fixed_distance_lengths[FIXED_DISTANCE_COUNT] = {
+    [0 ... 31] = 5
+};
 
 static char *im__read_entire_file(const char *file_path, size_t *bytes_read) {
     struct stat st;
@@ -202,14 +231,14 @@ static void im__parse_chunk_IHDR(png_info *info) {
     im__read_bytes_and_reverse(info, &ihdr_data_len, PNG_CHUNK_DATA_LEN); // this is guarunteed to be 13 in the spec, but we read anyway so that we don't fuck up the offset.
     printf("ihdr_data_length: %d\n", ihdr_data_len);
     if(ihdr_data_len != 13u){
-        IM_ERR("Length section of ihdr chunk is not 13. Corrupt PNG.");
+        IM_ERR("Length section of ihdr chunk is not 13.");
     }
 
     char ihdr_chunk_type[4];
     im__read_bytes(info, &ihdr_chunk_type, PNG_CHUNK_TYPE_LEN);
     printf("chunk type: ");
     printf("%.*s\n", PNG_CHUNK_TYPE_LEN, ihdr_chunk_type);
-    if(!info->first_ihdr) IM_ERR("Multiple IHDR, Corrupt PNG.");
+    if(!info->first_ihdr) IM_ERR("Multiple IHDR.");
 
     im__read_bytes_and_reverse(info, &info->width, 4);
     im__read_bytes_and_reverse(info, &info->height, 4);
@@ -227,7 +256,7 @@ static void im__parse_chunk_IHDR(png_info *info) {
 
 #ifndef IM_NO_ERRORS
     if(info->color_type == 1 || info->color_type > 6)
-        IM_ERR("Invalid color type. Expected 0, 2, 3, 4, or 6, got: %u Corrupt PNG.", info->color_type);
+        IM_ERR("Invalid color type. Expected 0, 2, 3, 4, or 6, got: %u", info->color_type);
     switch(info->color_type) {
         case 0:
             if(info->bits_per_channel !=1 && info->bits_per_channel !=2 && info->bits_per_channel !=4 && info->bits_per_channel !=8 && info->bits_per_channel !=16)
@@ -245,11 +274,11 @@ static void im__parse_chunk_IHDR(png_info *info) {
             break;
     }
     if(info->compression_method !=0)
-        IM_ERR("Compression method is supposed to be 0, but it's: %u. Corrupt PNG.", info->compression_method);
+        IM_ERR("Compression method is supposed to be 0, but it's: %u.", info->compression_method);
     if(info->filter_method !=0)
-        IM_ERR("Filter method is supposed to be 0, but it's %u. Corrupt PNG.", info->filter_method);
+        IM_ERR("Filter method is supposed to be 0, but it's %u.", info->filter_method);
     if(info->interlace_method !=0 && info->interlace_method !=1)
-        IM_ERR("Interlace method is supposed to be 0 or 1, but it's %u. Corrupt PNG.", info->interlace_method);
+        IM_ERR("Interlace method is supposed to be 0 or 1, but it's %u.", info->interlace_method);
 #endif
 
     printf("width: %d\n", info->width);
@@ -284,7 +313,7 @@ static void im__parse_chunk_gAMA(png_info *info) {
     im__read_bytes_and_reverse(info, &gAMA_data_len, PNG_CHUNK_DATA_LEN); // this is guarunteed to be 13 in the spec, but we read anyway so that we don't fuck up the offset.
     printf("gAMA_data_length: %d\n", gAMA_data_len);
     if(gAMA_data_len != 4u){
-        IM_ERR("Length section of gAMA chunk is not 13. Corrupt PNG.");
+        IM_ERR("Length section of gAMA chunk is not 13.");
     }
 
     char gAMA_chunk_type[4];
@@ -306,7 +335,7 @@ static void im__parse_chunk_cHRM(png_info *info) {
     im__read_bytes_and_reverse(info, &cHRM_data_len, PNG_CHUNK_DATA_LEN); // this is guarunteed to be 13 in the spec, but we read anyway so that we don't fuck up the offset.
     printf("cHRM_data_length: %d\n", cHRM_data_len);
     if(cHRM_data_len != 32u){
-        IM_ERR("Length section of cHRM chunk is not 32. Corrupt PNG.");
+        IM_ERR("Length section of cHRM chunk is not 32.");
     }
 
     char cHRM_chunk_type[4];
@@ -397,7 +426,7 @@ static void im__parse_chunk_tIME(png_info *info) {
     im__read_bytes_and_reverse(info, &tIME_data_len, PNG_CHUNK_DATA_LEN); // this is guarunteed to be 13 in the spec, but we read anyway so that we don't fuck up the offset.
     printf("tIME_data_length: %d\n", tIME_data_len);
     if(tIME_data_len != 7u){
-        IM_ERR("Length section of tIME chunk is not 13. Corrupt PNG.");
+        IM_ERR("Length section of tIME chunk is not 13.");
     }
 
     char tIME_chunk_type[4];
@@ -479,7 +508,7 @@ static void im__parse_chunk_IEND(png_info *info) {
     im__read_bytes_and_reverse(info, &IEND_data_len, PNG_CHUNK_DATA_LEN); // this is guarunteed to be 13 in the spec, but we read anyway so that we don't fuck up the offset.
     printf("IEND_data_length: %d\n", IEND_data_len);
     if(IEND_data_len != 0u){
-        IM_ERR("Length section of IEND chunk is not 0. Corrupt PNG.");
+        IM_ERR("Length section of IEND chunk is not 0.");
     }
 
     char IEND_chunk_type[4];
@@ -634,14 +663,14 @@ static char *decompress_png(png_info *info, char *current_IDAT_chunk) {
             printf("block_type %d, is_last_block %d\n", block_type, is_last_block);
             switch(block_type) {
                 case UNCOMPRESSED: {
-                    printf("Copying uncompressed block!\n");
+                    IM_INFO("Copying uncompressed block!\n");
                     align_next_byte(&bs);
 
                     uint16_t len  = read_bits(&bs, 16);
                     uint16_t nlen = read_bits(&bs, 16);
 
                     if ((len ^ nlen) != 0xFFFF) {
-                        fprintf(stderr, "Error: Corrupted stored block!\n");
+                        IM_ERR("Corrupted stored block!\n");
                     }
                     for (uint16_t i = 0; i < len; i++) {
                         info->png_pixels[offset++] = (uint8_t)read_bits(&bs, 8);
@@ -649,13 +678,26 @@ static char *decompress_png(png_info *info, char *current_IDAT_chunk) {
                     break;
                 }
                 case FIXED_HUFFMAN: {
+                    IM_INFO("Decompressing fixed huffman block!");
                     break;
                 }
                 case DYNAMIC_HUFFMAN: {
+                    IM_INFO("Decompressing dynamic huffman block!");
+                    uint8_t literal_code_count  = read_bits(&bs, 5) + 257;
+                    uint8_t distance_code_count = read_bits(&bs, 5) + 1;
+                    uint8_t huffman_code_count  = read_bits(&bs, 4) + 4;
+                    static const int code_length_order[19] =
+                        {16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15};
+                    uint8_t code_length_codes[19] = {0};
+
+                    for (int i = 0; i < huffman_code_count; i++) {
+                        code_length_codes[code_length_order[i]] = read_bits(&bs, 3);
+                    }
+
                     break;
                 }
                 case RESERVED: {
-                    fprintf(stderr, "Error: Encountered reserved (invalid) block type!\n");
+                    IM_ERR("Encountered reserved (invalid) block type!\n");
                     break;
                 }
             }
