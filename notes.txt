@@ -1,0 +1,38 @@
+we basically have this:
+
+
+the reference pointers are stored in a pair that looks like so:
+8 bits for uncompressed length, and 15 bits for distance
+                               (this is why the sliding window is 2^15)
+
+3.2.2. Use of Huffman coding in the "deflate" format
+
+ The Huffman codes used for each alphabet in the "deflate"
+ format have two additional rules:
+
+     * All codes of a given bit length have lexicographically
+       consecutive values, in the same order as the symbols
+       they represent;
+
+     * Shorter codes lexicographically precede longer codes.
+
+
+ We could recode the example above to follow this rule as
+ follows, assuming that the order of the alphabet is ABCD:
+
+    Symbol  Code
+    ------  ----
+    A       10
+    B       0
+    C       110
+    D       111
+
+C and D have the same length, so the have to be lexicographically consecutive.
+
+
+we basically have to do the following to decode a fixed hufman block:
+
+read a bit from the input stream, compare the bit against the codes in the huffman tree.
+if the value is less than 256, copy it.
+if the value is 256, break out of the loop.
+if the value is greater than 256, compute the distance.
