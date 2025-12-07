@@ -1,4 +1,10 @@
-#include "png.h"
+#include <stdio.h>
+
+#define PAL_IMPLEMENTATION
+#include "pal_single_header.h"
+
+#define IM_IMPLEMENTATION
+#include "im.h"
 
 int main(int argc, char **argv) {
 
@@ -9,9 +15,54 @@ int main(int argc, char **argv) {
     }
     char *file_path = argv[1];
 
-    int width, height, nr_channels;
-    char *image = im_load(file_path, &width, &height, &nr_channels, 0);
+    int image_width, image_height, nr_channels;
+    unsigned char *image = im_load(file_path, &image_width, &image_height, &nr_channels, 0);
+    pal_init();
+    pal_window *window = pal_create_window(800, 600, "image_viewer", 0);
+    int running = 1;
+    pal_event event;
+    pal_vec4 bg_color = {1.0f, 1.0f, 1.0f, 1.0f};
 
-    printf("width: %d, height: %d, num_channels: %d\n", width, height, nr_channels);
+    while(running) {
+        while(pal_poll_events(&event)) {
+
+        }
+
+        if(pal_is_key_pressed(-1, PAL_SCAN_ESCAPE) || pal_is_key_pressed(-1, PAL_SCAN_CAPSLOCK)) {
+            exit(0);
+        }
+
+        size_t img_pixel_idx = 0;
+
+        for(int y = 0; y < image_height; y++) {
+            for(int x = 0; x < image_width; x++) {
+                /* PBM_TEST */
+#if 0
+                pal_vec4 color;
+                color.r = (float)image[img_pixel_idx];
+                color.g = (float)image[img_pixel_idx];
+                color.b = (float)image[img_pixel_idx];
+                color.a = (float)image[img_pixel_idx];
+                img_pixel_idx++;
+                pal_draw_rect(window, x + 400, y + 300, 1, 1, color);
+
+#endif
+                // Read source color from PNG
+                float src_r = (float)image[img_pixel_idx++] / 255.0f;
+                float src_g = (float)image[img_pixel_idx++] / 255.0f;
+                float src_b = (float)image[img_pixel_idx++] / 255.0f;
+                float src_a = (float)image[img_pixel_idx++] / 255.0f;
+                
+                // Alpha blend with background
+                pal_vec4 color;
+                color.r = src_r * src_a + bg_color.r * (1.0f - src_a);
+                color.g = src_g * src_a + bg_color.g * (1.0f - src_a);
+                color.b = src_b * src_a + bg_color.b * (1.0f - src_a);
+                color.a = 1.0f; // Fully opaque after blending
+                
+                pal_draw_rect(window, x + 400, y + 300, 1, 1, color);
+            }
+        }
+    }
     return 0;
 }

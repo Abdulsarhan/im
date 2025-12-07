@@ -6162,12 +6162,13 @@ void linux_x11_init_raw_input();
 
 PALAPI void pal_init(void) {
     pal__init_eventq();
-    linux_x11_init_raw_input();
+    /* opening the display has to happen before initing the raw input */
     g_display = XOpenDisplay(NULL);
     if (!g_display) {
         fprintf(stderr, "Failed to open display\n");
         return;
     }
+    linux_x11_init_raw_input();
     g_wm_delete = XInternAtom(g_display, "WM_DELETE_WINDOW", False);
 }
 
@@ -6340,8 +6341,11 @@ void linux_x11_create_dummy_window() {
         BlackPixel(g_display, screen)
     );
 
+    // I don't think that we are supposed to map this window.
+#if 0
     XMapWindow(g_display, g_dummy_window);
     XFlush(g_display);
+#endif
 }
 
 void linux_x11_init_raw_input() {

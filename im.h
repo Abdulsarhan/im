@@ -13,7 +13,7 @@ extern "C" {
 #endif
 
 #define IM_API extern
-IM_API char *im_load(const char *image_path, int *width, int *height, int *number_of_channels, int desired_channels) {
+IM_API unsigned char *im_load(const char *image_path, int *width, int *height, int *number_of_channels, int desired_channels);
 
 #ifdef __cplusplus
 }
@@ -29,6 +29,7 @@ IM_API char *im_load(const char *image_path, int *width, int *height, int *numbe
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <assert.h> // for testing only, should be removed in prod.
 
 #ifndef _STDINT_H
 /* 8-bit type */
@@ -115,8 +116,8 @@ typedef signed   long long int64_t;
      ((uint32_t)(d) << 24))
 
 typedef int im_bool;
-#define IM_TRUE 1
-#define IM_FALSE 0
+#define im_true 1
+#define im_false 0
 
 typedef enum {
     GRAYSCALE = 0,
@@ -206,12 +207,10 @@ typedef struct{
     uint8_t hour;
     uint8_t minute;
     uint8_t second;
-    char *png_pixels; /* the actual pixels of the image, uncompressed. */
+    unsigned char *png_pixels; /* the actual pixels of the image, uncompressed. */
 }im_png_info;
 
 uint8_t im_png_sig[PNG_SIG_LEN] = {137, 80, 78, 71, 13, 10, 26, 10};
-
-
 
 void *im_memcpy(void *dest, const void *src, size_t n) {
     unsigned char *d = dest;
@@ -236,7 +235,7 @@ int im_memcmp(const void *a, const void *b, size_t n) {
     return 0;
 }
 
-static char *im__read_entire_file(const char *file_path, size_t *bytes_read) {
+char *im__read_entire_file(const char *file_path, size_t *bytes_read) {
 #ifdef _WIN32
     wchar_t* wide_path = win32_utf8_to_utf16(file_path);
     HANDLE file = NULL;
@@ -325,7 +324,7 @@ static char *im__read_entire_file(const char *file_path, size_t *bytes_read) {
 #endif
 }
 
-static void im_png_print_bytes(void *bytes_in, size_t len) {
+void im_png_print_bytes(void *bytes_in, size_t len) {
     uint8_t *bytes = bytes_in;
     for(size_t i = 0; i < len; i++) {
         printf("%u ", bytes[i]);
@@ -333,7 +332,7 @@ static void im_png_print_bytes(void *bytes_in, size_t len) {
     printf("\n");
 }
 
-static void im_png_print_string(const char* str, size_t len) {
+void im_png_print_string(const char* str, size_t len) {
     size_t i;
     for(i = 0; i < len; i++) {
         printf("%c ", str[i]);
@@ -341,7 +340,7 @@ static void im_png_print_string(const char* str, size_t len) {
     printf("\n");
 }
 
-static uint8_t *im_png_reverse_bytes(void *buf_in, size_t buf_len) {
+uint8_t *im_png_reverse_bytes(void *buf_in, size_t buf_len) {
     uint8_t *buf = buf_in;
     size_t i;
     uint8_t temp;
@@ -353,7 +352,7 @@ static uint8_t *im_png_reverse_bytes(void *buf_in, size_t buf_len) {
     return buf;
 }
 
-static void im_png_read_bytes(im_png_info *info, void* buf, const size_t bytes_to_read) {
+void im_png_read_bytes(im_png_info *info, void* buf, const size_t bytes_to_read) {
     if(info->bytes_read + bytes_to_read <= info->file_size) {
         if(buf != 0) { // we only copy the data if the user wants to pass in a buffer
             im_memcpy(buf, info->png_file + info->bytes_read, bytes_to_read);
@@ -364,7 +363,7 @@ static void im_png_read_bytes(im_png_info *info, void* buf, const size_t bytes_t
     }
 }
 
-static void im_png_read_bytes_and_reverse(im_png_info *info, void* buf, const size_t bytes_to_read) {
+void im_png_read_bytes_and_reverse(im_png_info *info, void* buf, const size_t bytes_to_read) {
     if(info->bytes_read + bytes_to_read <= info->file_size) {
         if(buf != 0) { // we only copy the data if the user wants to pass in a buffer
             im_memcpy(buf, info->png_file + info->bytes_read, bytes_to_read);
@@ -380,7 +379,7 @@ size_t im__ceil(size_t x, size_t y) {
     return (x + y - 1) / y;
 }
 
-static void im_png_parse_chunk_IHDR(im_png_info *info) {
+void im_png_parse_chunk_IHDR(im_png_info *info) {
     uint32_t ihdr_data_len = 0;
     im_png_read_bytes_and_reverse(info, &ihdr_data_len, PNG_CHUNK_DATA_LEN); // this is guarunteed to be 13 in the spec, but we read anyway so that we don't fuck up the offset.
     printf("ihdr_data_length: %d\n", ihdr_data_len);
@@ -462,7 +461,7 @@ static void im_png_parse_chunk_IHDR(im_png_info *info) {
     }
 }
 
-static void im_png_parse_chunk_gAMA(im_png_info *info) {
+ void im_png_parse_chunk_gAMA(im_png_info *info) {
     uint32_t gAMA_data_len = 0;
     im_png_read_bytes_and_reverse(info, &gAMA_data_len, PNG_CHUNK_DATA_LEN); /* this is guarunteed to be 13 in the spec, but we read anyway so that we don't fuck up the offset. */
     printf("gAMA_data_length: %d\n", gAMA_data_len);
@@ -484,7 +483,7 @@ static void im_png_parse_chunk_gAMA(im_png_info *info) {
     im_png_read_bytes_and_reverse(info, &crc, PNG_CHUNK_CRC_LEN);
 }
 
-static void im_png_parse_chunk_cHRM(im_png_info *info) {
+void im_png_parse_chunk_cHRM(im_png_info *info) {
     uint32_t cHRM_data_len = 0;
     im_png_read_bytes_and_reverse(info, &cHRM_data_len, PNG_CHUNK_DATA_LEN); /* this is guarunteed to be 13 in the spec, but we read anyway so that we don't fuck up the offset. */
     printf("cHRM_data_length: %d\n", cHRM_data_len);
@@ -527,7 +526,7 @@ static void im_png_parse_chunk_cHRM(im_png_info *info) {
     im_png_read_bytes_and_reverse(info, &crc, PNG_CHUNK_CRC_LEN);
 }
 
-static void im_png_parse_chunk_bKGD(im_png_info *info) {
+void im_png_parse_chunk_bKGD(im_png_info *info) {
     uint32_t bKGD_data_len = 0;
     im_png_read_bytes_and_reverse(info, &bKGD_data_len, PNG_CHUNK_DATA_LEN); /* this is guarunteed to be 13 in the spec, but we read anyway so that we don't fuck up the offset. */
     printf("bKGD_data_length: %d\n", bKGD_data_len);
@@ -575,7 +574,7 @@ static void im_png_parse_chunk_bKGD(im_png_info *info) {
     im_png_read_bytes_and_reverse(info, &crc, PNG_CHUNK_CRC_LEN);
 }
 
-static void im_png_parse_chunk_tIME(im_png_info *info) {
+void im_png_parse_chunk_tIME(im_png_info *info) {
     uint32_t tIME_data_len = 0;
     im_png_read_bytes_and_reverse(info, &tIME_data_len, PNG_CHUNK_DATA_LEN); /* this is guarunteed to be 13 in the spec, but we read anyway so that we don't fuck up the offset. */
     printf("tIME_data_length: %d\n", tIME_data_len);
@@ -599,7 +598,7 @@ static void im_png_parse_chunk_tIME(im_png_info *info) {
     im_png_read_bytes_and_reverse(info, &crc, PNG_CHUNK_CRC_LEN);
 }
 
-static void im_png_parse_chunk_IDAT(im_png_info *info) {
+void im_png_parse_chunk_IDAT(im_png_info *info) {
     uint32_t IDAT_data_len = 0;
     im_png_read_bytes_and_reverse(info, &IDAT_data_len, PNG_CHUNK_DATA_LEN);
     printf("IDAT_data_length: %d\n", IDAT_data_len);
@@ -625,7 +624,7 @@ static void im_png_parse_chunk_IDAT(im_png_info *info) {
     im_png_print_bytes(&crc, PNG_CHUNK_CRC_LEN);
 }
 
-static void im_png_parse_chunk_tEXT(im_png_info *info) {
+void im_png_parse_chunk_tEXT(im_png_info *info) {
     uint32_t tEXT_data_len = 0;
     im_png_read_bytes_and_reverse(info, &tEXT_data_len, PNG_CHUNK_DATA_LEN);
     printf("tEXT_data_length: %d\n", tEXT_data_len);
@@ -657,7 +656,7 @@ static void im_png_parse_chunk_tEXT(im_png_info *info) {
     im_png_read_bytes_and_reverse(info, &crc, PNG_CHUNK_CRC_LEN);
 }
 
-static void im_png_parse_chunk_IEND(im_png_info *info) {
+void im_png_parse_chunk_IEND(im_png_info *info) {
     uint32_t IEND_data_len = 0;
     im_png_read_bytes_and_reverse(info, &IEND_data_len, PNG_CHUNK_DATA_LEN); /* this is guarunteed to be 13 in the spec, but we read anyway so that we don't fuck up the offset. */
     printf("IEND_data_length: %d\n", IEND_data_len);
@@ -692,7 +691,7 @@ char *get_next_chunk_type(im_png_info *info) {
     }
 }
 
-static void skip_chunk(im_png_info *info) {
+void skip_chunk(im_png_info *info) {
     uint32_t length_be = 0;
     im_png_read_bytes(info, &length_be, 4);
     im_png_reverse_bytes(&length_be, 4);
@@ -704,7 +703,7 @@ static void skip_chunk(im_png_info *info) {
     info->bytes_read += bytes_to_skip;
 }
 
-static void im_png_peek_bytes(im_png_info *info, void* buf, char *offset, const size_t bytes_to_read) {
+void im_png_peek_bytes(im_png_info *info, void* buf, char *offset, const size_t bytes_to_read) {
     if(offset < info->png_file + info->file_size) {
         im_memcpy(buf, offset, bytes_to_read);
     } else {
@@ -712,7 +711,7 @@ static void im_png_peek_bytes(im_png_info *info, void* buf, char *offset, const 
     }
 }
 
-static char* im_png_peek_next_chunk(im_png_info *info, char *current_chunk) {
+char* im_png_peek_next_chunk(im_png_info *info, char *current_chunk) {
     uint32_t data_length = 0;
     im_png_peek_bytes(info, &data_length, current_chunk, PNG_CHUNK_DATA_LEN);
     im_png_reverse_bytes(&data_length, PNG_CHUNK_DATA_LEN);
@@ -737,7 +736,7 @@ uint32_t consume_bits(im__bitstream *bs, int n) {
     return val;
 }
 
-static inline void align_next_byte(im__bitstream *bs) {
+void align_next_byte(im__bitstream *bs) {
     size_t bits_out_of_alignment = bs->bitpos & 7;
     if(bits_out_of_alignment) {
         consume_bits(bs, 8 - bits_out_of_alignment);
@@ -762,7 +761,7 @@ typedef struct {
 huffman_tree literal_length_tree[FIXED_LITERAL_COUNT];
 huffman_tree distance_tree[FIXED_DISTANCE_COUNT];
 
-static void im_png_build_fixed_huffman_tree() {
+void im_png_build_fixed_huffman_tree() {
     static const uint8_t fixed_literal_length_code_lengths[FIXED_LITERAL_COUNT] = {
         /* literal values are from 0 to 255 */
         /* 0 ... 143 = 144 */
@@ -848,6 +847,90 @@ static void im_png_build_fixed_huffman_tree() {
 
 }
 
+// Paeth predictor function for filter type 4
+static uint8_t paeth_predictor(uint8_t a, uint8_t b, uint8_t c) {
+    int p = a + b - c;
+    int pa = abs(p - a);
+    int pb = abs(p - b);
+    int pc = abs(p - c);
+    
+    if (pa <= pb && pa <= pc) return a;
+    else if (pb <= pc) return b;
+    else return c;
+}
+
+// Unfilter the decompressed image data
+static void im_png_unfilter(im_png_info *info) {
+    size_t bytes_per_pixel = (info->bits_per_channel * info->channel_count + 7) / 8;
+    size_t bytes_per_scanline = (info->width * info->channel_count * info->bits_per_channel + 7) / 8;
+    size_t stride = bytes_per_scanline + 1; // +1 for filter byte
+    
+    printf("Unfiltering: bytes_per_pixel=%zu, bytes_per_scanline=%zu\n", bytes_per_pixel, bytes_per_scanline);
+    
+    for (size_t y = 0; y < info->height; y++) {
+        size_t scanline_offset = y * stride;
+        uint8_t filter_type = info->png_pixels[scanline_offset];
+        uint8_t *scanline = (uint8_t*)info->png_pixels + scanline_offset + 1;
+        uint8_t *prev_scanline = (y > 0) ? (uint8_t*)info->png_pixels + (y - 1) * stride + 1 : NULL;
+        
+        switch (filter_type) {
+            case 0: // None
+                break;
+                
+            case 1: // Sub
+                for (size_t x = bytes_per_pixel; x < bytes_per_scanline; x++) {
+                    scanline[x] = (scanline[x] + scanline[x - bytes_per_pixel]) & 0xFF;
+                }
+                break;
+                
+            case 2: // Up
+                if (prev_scanline) {
+                    for (size_t x = 0; x < bytes_per_scanline; x++) {
+                        scanline[x] = (scanline[x] + prev_scanline[x]) & 0xFF;
+                    }
+                }
+                break;
+                
+            case 3: // Average
+                for (size_t x = 0; x < bytes_per_scanline; x++) {
+                    uint8_t left = (x >= bytes_per_pixel) ? scanline[x - bytes_per_pixel] : 0;
+                    uint8_t up = prev_scanline ? prev_scanline[x] : 0;
+                    scanline[x] = (scanline[x] + ((left + up) / 2)) & 0xFF;
+                }
+                break;
+                
+            case 4: // Paeth
+                for (size_t x = 0; x < bytes_per_scanline; x++) {
+                    uint8_t left = (x >= bytes_per_pixel) ? scanline[x - bytes_per_pixel] : 0;
+                    uint8_t up = prev_scanline ? prev_scanline[x] : 0;
+                    uint8_t up_left = (prev_scanline && x >= bytes_per_pixel) ? prev_scanline[x - bytes_per_pixel] : 0;
+                    scanline[x] = (scanline[x] + paeth_predictor(left, up, up_left)) & 0xFF;
+                }
+                break;
+                
+            default:
+                IM_ERR("Unknown filter type: %d", filter_type);
+                break;
+        }
+    }
+    
+    // Now remove the filter bytes and compact the data
+    char *unfiltered = malloc(info->height * bytes_per_scanline);
+    if (!unfiltered) {
+        IM_ERR("Failed to allocate memory for unfiltered data");
+        return;
+    }
+    
+    for (size_t y = 0; y < info->height; y++) {
+        size_t src_offset = y * stride + 1; // +1 to skip filter byte
+        size_t dst_offset = y * bytes_per_scanline;
+        im_memcpy(unfiltered + dst_offset, info->png_pixels + src_offset, bytes_per_scanline);
+    }
+    
+    free(info->png_pixels);
+    info->png_pixels = unfiltered;
+}
+
 // Length codes 257-285 map to these base lengths
 static const uint16_t length_base[29] = {
     3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
@@ -873,7 +956,7 @@ static const uint8_t distance_extra[30] = {
 };
 
 // Decode a symbol from fixed Huffman literal/length tree
-static int decode_fixed_literal_length(im__bitstream *bs) {
+int decode_fixed_literal_length(im__bitstream *bs) {
     uint32_t code = 0;
     
     // Read 7 bits first
@@ -909,7 +992,7 @@ static int decode_fixed_literal_length(im__bitstream *bs) {
 }
 
 // Decode a distance code from fixed Huffman distance tree
-static int decode_fixed_distance(im__bitstream *bs) {
+int decode_fixed_distance(im__bitstream *bs) {
     // All distance codes are 5 bits in fixed Huffman
     uint32_t code = 0;
     for (int i = 0; i < 5; i++) {
@@ -926,7 +1009,7 @@ static int decode_fixed_distance(im__bitstream *bs) {
 }
 
 
-static void build_huffman_tree(huffman_tree *tree, uint8_t *lengths, int count) {
+void build_huffman_tree(huffman_tree *tree, uint8_t *lengths, int count) {
     int bl_count[16] = {0};
     int next_code[16] = {0};
     
@@ -961,7 +1044,7 @@ static void build_huffman_tree(huffman_tree *tree, uint8_t *lengths, int count) 
 }
 
 
-static int decode_symbol(im__bitstream *bs, huffman_tree *tree, int max_symbols) {
+int decode_symbol(im__bitstream *bs, huffman_tree *tree, int max_symbols) {
     uint32_t code = 0;
     size_t start_pos = bs->bitpos;
     
@@ -988,7 +1071,7 @@ static int decode_symbol(im__bitstream *bs, huffman_tree *tree, int max_symbols)
     return -1;
 }
 
-static char *im_png_decompress(im_png_info *info, char *current_IDAT_chunk, size_t *idat_chunk_count) {
+char *im_png_decompress(im_png_info *info, char *current_IDAT_chunk, size_t *idat_chunk_count) {
 
     uint32_t comp_data_size = 0;
     uint32_t tmp = 0;
@@ -1133,7 +1216,7 @@ static char *im_png_decompress(im_png_info *info, char *current_IDAT_chunk, size
                     uint16_t HDIST = consume_bits(&bs, 5) + 1;    // # of distance codes
                     uint16_t HCLEN = consume_bits(&bs, 4) + 4;    // # of code length codes
                     
-                    printf("HLIT=%d, HDIST=%d, HCLEN=%d\n", HLIT, HDIST, HCLEN);
+                    //printf("HLIT=%d, HDIST=%d, HCLEN=%d\n", HLIT, HDIST, HCLEN);
                     
                     static const int code_length_order[19] = {
                         16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15
@@ -1151,10 +1234,10 @@ static char *im_png_decompress(im_png_info *info, char *current_IDAT_chunk, size
                     build_huffman_tree(code_length_tree, code_length_lengths, 19);
                     
                     // Debug: print code length tree
-                    printf("Code length tree:\n");
+                    //printf("Code length tree:\n");
                     for (int i = 0; i < 19; i++) {
                         if (code_length_tree[i].len > 0) {
-                            printf("  Symbol %d: len=%d, code=%d\n", i, code_length_tree[i].len, code_length_tree[i].code);
+                            //printf("  Symbol %d: len=%d, code=%d\n", i, code_length_tree[i].len, code_length_tree[i].code);
                         }
                     }
                     
@@ -1176,7 +1259,7 @@ static char *im_png_decompress(im_png_info *info, char *current_IDAT_chunk, size
                             break;
                         }
                         
-                        printf("Decoded symbol %d at position %d\n", symbol, i);
+                        //printf("Decoded symbol %d at position %d\n", symbol, i);
                         
                         if (symbol < 16) {
                             // Literal length
@@ -1305,13 +1388,14 @@ static char *im_png_decompress(im_png_info *info, char *current_IDAT_chunk, size
         fprintf(stderr, "Error: Integrity check failed.\n");
     }
 
+    im_png_unfilter(info);
     return info->png_pixels;
 }
 
-char *im_png_load(char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
+unsigned char *im_png_load(char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
 
     im_png_info info = {0};
-    info.first_ihdr = IM_TRUE;
+    info.first_ihdr = im_true;
     info.png_file = image_file;
     info.file_size = file_size;
 
@@ -1405,7 +1489,126 @@ char *im_png_load(char *image_file, size_t file_size, int *width, int *height, i
     return info.png_pixels;
 }
 
-IM_API char *im_load(const char *image_path, int *width, int *height, int *number_of_channels, int desired_channels) {
+static int consume_byte(char **current_pos, char *end_of_file) {
+    if (*current_pos < end_of_file) {
+        return *(*current_pos)++;
+    }
+    return -1; /* EOF indicator */
+}
+
+static int peek_byte(char *current_pos, char *end_of_file) {
+    if (current_pos < end_of_file) {
+        return *current_pos;
+    }
+    return -1; /* EOF indicator */
+}
+
+unsigned char *im_p1_load(char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
+    if (!image_file || file_size < 3) return NULL;
+    
+    char *at = image_file;
+    char *end_of_file = image_file + file_size;
+    unsigned char *pixels = NULL;
+    unsigned char *pixel_write_pos = NULL;
+    *num_channels = 1;
+    *width = 0;
+    *height = 0;
+    
+    consume_byte(&at, end_of_file); /* skip 'P' */
+    consume_byte(&at, end_of_file); /* skip '1' */
+    
+    /* skip whitespace after P1 */
+    int c;
+    while ((c = peek_byte(at, end_of_file)) != -1 && (c == ' ' || c == '\n' || c == '\r' || c == '\t')) {
+        consume_byte(&at, end_of_file);
+    }
+    
+    /* skip comment lines */
+    while (peek_byte(at, end_of_file) == '#') {
+        while ((c = consume_byte(&at, end_of_file)) != -1 && c != '\n') {
+            /* consume comment */
+        }
+        /* skip whitespace after comment */
+        while ((c = peek_byte(at, end_of_file)) != -1 && (c == ' ' || c == '\r' || c == '\t')) {
+            consume_byte(&at, end_of_file);
+        }
+    }
+    
+    /* parse width */
+    c = peek_byte(at, end_of_file);
+    if (c >= '0' && c <= '9') {
+        int value = 0;
+        while ((c = peek_byte(at, end_of_file)) >= '0' && c <= '9') {
+            value = value * 10 + (c - '0');
+            consume_byte(&at, end_of_file);
+        }
+        *width = value;
+    } else {
+        return NULL;
+    }
+    
+    /* skip whitespace between width and height */
+    while ((c = peek_byte(at, end_of_file)) != -1 && (c == ' ' || c == '\t')) {
+        consume_byte(&at, end_of_file);
+    }
+    
+    /* parse height */
+    c = peek_byte(at, end_of_file);
+    if (c >= '0' && c <= '9') {
+        int value = 0;
+        while ((c = peek_byte(at, end_of_file)) >= '0' && c <= '9') {
+            value = value * 10 + (c - '0');
+            consume_byte(&at, end_of_file);
+        }
+        *height = value;
+    } else {
+        return NULL;
+    }
+    
+    /* validate dimensions */
+    if (*width <= 0 || *height <= 0 || *width > 100000 || *height > 100000) {
+        return NULL;
+    }
+    
+    /* allocate pixel buffer */
+    size_t pixel_count = (size_t)(*width) * (*height);
+    pixels = malloc(pixel_count);
+    if (!pixels) return NULL;
+    
+    pixel_write_pos = pixels;
+    size_t pixels_written = 0;
+    
+    /* skip to start of pixel data */
+    while ((c = peek_byte(at, end_of_file)) != -1 && (c == ' ' || c == '\n' || c == '\r' || c == '\t')) {
+        consume_byte(&at, end_of_file);
+    }
+    
+    /* parse pixel data */
+    while ((c = consume_byte(&at, end_of_file)) != -1 && pixels_written < pixel_count) {
+        if (c == '0') {
+            *pixel_write_pos++ = 0;    /* white */
+            pixels_written++;
+        }
+        else if (c == '1') {
+            *pixel_write_pos++ = 255;  /* black */
+            pixels_written++;
+        }
+        /* else skip whitespace and other characters */
+    }
+
+    return pixels;
+}
+
+unsigned char *im_pgm_ascii_load(char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
+    image_file += 2;
+
+}
+
+unsigned char *im_ppm_ascii_load(char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
+    image_file += 2; /* ignore sig */
+}
+
+IM_API unsigned char *im_load(const char *image_path, int *width, int *height, int *number_of_channels, int desired_channels) {
 
     size_t file_size = 0;
     char *image_file = im__read_entire_file(image_path, &file_size);
@@ -1425,9 +1628,18 @@ IM_API char *im_load(const char *image_path, int *width, int *height, int *numbe
 
     if(im_memcmp(im_png_sig, file_sig, PNG_SIG_LEN) == 0) {
         return im_png_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+    } else if(im_memcmp(file_sig, "P1", 2) == 0) {
+        return im_p1_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+    } else if(im_memcmp(file_sig, "P2", 2) == 0) {
+        return im_pgm_ascii_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+    } else if(im_memcmp(file_sig, "P3", 2) == 0) {
+        return im_ppm_ascii_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+    } else {
+        return NULL;
     }
 
     fprintf(stderr, "ERROR: File signature does not match any known image formats.\n");
     return NULL;
 }
+
 #endif // IM_IMPLEMENTATION
