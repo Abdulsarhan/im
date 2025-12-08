@@ -168,8 +168,8 @@ typedef enum {
 
 typedef struct{
     char *png_file;
-    size_t file_size;
-    size_t bytes_read;
+    char *at; // newer variable used for parsing
+    char *end_of_file; // we use at + end of file to figure out where we are, and where the end is so that we don't go over.
     uint32_t width;
     uint32_t height;
     uint8_t channel_count; /* channels are called "samples" in the spec, but that's stupid, so I won't call them samples. */
@@ -340,76 +340,61 @@ void im_png_print_string(const char* str, size_t len) {
     printf("\n");
 }
 
-uint8_t *im_png_reverse_bytes(void *buf_in, size_t buf_len) {
-    uint8_t *buf = buf_in;
-    size_t i;
-    uint8_t temp;
-    for(i = 0; i < buf_len / 2; i++) {
-        temp = buf[i];
-        buf[i] = buf[buf_len - i - 1];
-        buf[buf_len - i - 1] = temp;
+//#define consume(at, end_of_file, size) (consume_size(at, end_of_file, size))
+void *consume(char **at, char *end_of_file, size_t size) {
+    void *orig = *at;
+    if(*at + size <= end_of_file) {
+        *at += size;
+        return orig;
     }
-    return buf;
+    fprintf(stderr, "Error: %s(), will not read past end of file.", __func__);
+    return orig;
 }
 
-void im_png_read_bytes(im_png_info *info, void* buf, const size_t bytes_to_read) {
-    if(info->bytes_read + bytes_to_read <= info->file_size) {
-        if(buf != 0) { // we only copy the data if the user wants to pass in a buffer
-            im_memcpy(buf, info->png_file + info->bytes_read, bytes_to_read);
-        }
-        info->bytes_read += bytes_to_read;
-    } else {
-        fprintf(stderr, "Error: %s(): tried to read bytes past end of file, not going to read.", __func__);
-    }
+void endian_swap(uint32_t *start) {
+    uint32_t value = *start;
+    value = (value << 24) | (value << 8) & 0x00FF0000 | (value >> 8) & 0x0000FF00 | (value >> 24);
+    *start = value;
 }
 
-void im_png_read_bytes_and_reverse(im_png_info *info, void* buf, const size_t bytes_to_read) {
-    if(info->bytes_read + bytes_to_read <= info->file_size) {
-        if(buf != 0) { // we only copy the data if the user wants to pass in a buffer
-            im_memcpy(buf, info->png_file + info->bytes_read, bytes_to_read);
-        }
-        info->bytes_read += bytes_to_read;
-        im_png_reverse_bytes(buf, bytes_to_read);
-    } else {
-        fprintf(stderr, "Error: %s(): tried to read bytes past end of file, not going to read.", __func__);
-    }
+// this function simply assumes that you will pass in the start of the uint32_t using the at.
+void *consume_and_endian_swap(char **at, char *end_of_file, size_t size) {
+    void *value = consume(at, end_of_file, size);
+    endian_swap(value);
+    return value;
 }
 
-size_t im__ceil(size_t x, size_t y) {
+size_t im_ceil(size_t x, size_t y) {
     return (x + y - 1) / y;
 }
 
 void im_png_parse_chunk_IHDR(im_png_info *info) {
-    uint32_t ihdr_data_len = 0;
-    im_png_read_bytes_and_reverse(info, &ihdr_data_len, PNG_CHUNK_DATA_LEN); // this is guarunteed to be 13 in the spec, but we read anyway so that we don't fuck up the offset.
-    printf("ihdr_data_length: %d\n", ihdr_data_len);
-    if(ihdr_data_len != 13u){
+    uint32_t length = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
+    printf("Length: %d\n", length);
+    if(length != 13u){
         IM_ERR("Length section of ihdr chunk is not 13.");
     }
 
-    char ihdr_chunk_type[4];
-    im_png_read_bytes(info, &ihdr_chunk_type, PNG_CHUNK_TYPE_LEN);
-    printf("chunk type: ");
-    printf("%.*s\n", PNG_CHUNK_TYPE_LEN, ihdr_chunk_type);
+    char *chunk_type = (char*)consume(&info->at, info->end_of_file, sizeof(uint32_t));
+    printf("chunk_type: %.*s\n", 4, chunk_type);
+
     if(!info->first_ihdr) IM_ERR("Multiple IHDR.");
 
-    im_png_read_bytes_and_reverse(info, &info->width, 4);
-    im_png_read_bytes_and_reverse(info, &info->height, 4);
+    info->width = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
+    info->height = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
+    info->bits_per_channel = *(uint32_t*)consume(&info->at, info->end_of_file, 1);
+    info->color_type = *(uint32_t*)consume(&info->at, info->end_of_file, 1);
+    info->compression_method = *(uint32_t*)consume(&info->at, info->end_of_file, 1);
+    info->filter_method = *(uint32_t*)consume(&info->at, info->end_of_file, 1);
+    info->interlace_method = *(uint32_t*)consume(&info->at, info->end_of_file, 1);
 
-    im_png_read_bytes_and_reverse(info, &info->bits_per_channel, 1);
-    im_png_read_bytes_and_reverse(info, &info->color_type, 1);
-    im_png_read_bytes_and_reverse(info, &info->compression_method, 1);
-    im_png_read_bytes_and_reverse(info, &info->filter_method, 1);
-    im_png_read_bytes_and_reverse(info, &info->interlace_method, 1);
-
-    uint32_t crc;
-    im_png_read_bytes_and_reverse(info, &crc, PNG_CHUNK_CRC_LEN);
-    printf("ihdr_crc: ");
-    im_png_print_bytes(&crc, PNG_CHUNK_CRC_LEN);
+    uint32_t *crc = (uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
 
 #ifndef IM_NO_ERRORS
-    if(info->color_type == 1 || info->color_type > 6)
+    if(info->color_type == 1 || info->color_type > 6) {
         IM_ERR("Invalid color type. Expected 0, 2, 3, 4, or 6, got: %u", info->color_type);
+    }
+
     switch(info->color_type) {
         case 0:
             if(info->bits_per_channel !=1 && info->bits_per_channel !=2 && info->bits_per_channel !=4 && info->bits_per_channel !=8 && info->bits_per_channel !=16)
@@ -426,11 +411,11 @@ void im_png_parse_chunk_IHDR(im_png_info *info) {
                 IM_ERR("Invalid bit depth for color type 6. Expected 8 or 16, got: %u", info->bits_per_channel);
             break;
     }
-    if(info->compression_method !=0)
+    if(info->compression_method != 0)
         IM_ERR("Compression method is supposed to be 0, but it's: %u.", info->compression_method);
-    if(info->filter_method !=0)
+    if(info->filter_method != 0)
         IM_ERR("Filter method is supposed to be 0, but it's %u.", info->filter_method);
-    if(info->interlace_method !=0 && info->interlace_method !=1)
+    if(info->interlace_method != 0 && info->interlace_method != 1)
         IM_ERR("Interlace method is supposed to be 0 or 1, but it's %u.", info->interlace_method);
 #endif
 
@@ -462,56 +447,48 @@ void im_png_parse_chunk_IHDR(im_png_info *info) {
 }
 
  void im_png_parse_chunk_gAMA(im_png_info *info) {
-    uint32_t gAMA_data_len = 0;
-    im_png_read_bytes_and_reverse(info, &gAMA_data_len, PNG_CHUNK_DATA_LEN); /* this is guarunteed to be 13 in the spec, but we read anyway so that we don't fuck up the offset. */
-    printf("gAMA_data_length: %d\n", gAMA_data_len);
-    if(gAMA_data_len != 4u){
-        IM_ERR("Length section of gAMA chunk is not 13.");
+    uint32_t length = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
+    printf("gAMA_data_length: %d\n", length);
+    if(length != 4u){
+        IM_ERR("Length section of gAMA chunk is not 4.");
     }
 
-    char gAMA_chunk_type[4];
-    im_png_read_bytes(info, &gAMA_chunk_type, PNG_CHUNK_TYPE_LEN);
-    printf("chunk type: ");
-    printf("%.*s\n", PNG_CHUNK_TYPE_LEN, gAMA_chunk_type);
+    char *chunk_type = (char*)consume(&info->at, info->end_of_file, sizeof(uint32_t));
+    printf("chunk_type: %.*s\n", PNG_CHUNK_TYPE_LEN, chunk_type);
 
-    uint32_t tmp;
-    im_png_read_bytes_and_reverse(info, &tmp, 4);
+    uint32_t tmp  = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
     info->gamma = tmp / 100000.0;
     printf("gAMA chunk: gamma = %.5f\n", info->gamma);
 
-    uint32_t crc;
-    im_png_read_bytes_and_reverse(info, &crc, PNG_CHUNK_CRC_LEN);
+    uint32_t *crc = (uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
 }
 
 void im_png_parse_chunk_cHRM(im_png_info *info) {
-    uint32_t cHRM_data_len = 0;
-    im_png_read_bytes_and_reverse(info, &cHRM_data_len, PNG_CHUNK_DATA_LEN); /* this is guarunteed to be 13 in the spec, but we read anyway so that we don't fuck up the offset. */
-    printf("cHRM_data_length: %d\n", cHRM_data_len);
-    if(cHRM_data_len != 32u){
+    uint32_t length = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
+    printf("cHRM_data_length: %d\n", length);
+    if(length != 32u){
         IM_ERR("Length section of cHRM chunk is not 32.");
     }
 
-    char cHRM_chunk_type[4];
-    im_png_read_bytes(info, &cHRM_chunk_type, PNG_CHUNK_TYPE_LEN);
-    printf("chunk type: ");
-    printf("%.*s\n", PNG_CHUNK_TYPE_LEN, cHRM_chunk_type);
+    char *chunk_type = (char*)consume(&info->at, info->end_of_file, sizeof(uint32_t));
+    printf("chunk_type: %.*s\n", PNG_CHUNK_TYPE_LEN, chunk_type);
 
     uint32_t tmp;
-    im_png_read_bytes_and_reverse(info, &tmp, 4);
+    tmp = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
     info->white_x = tmp / 100000.0;
-    im_png_read_bytes_and_reverse(info, &tmp, 4);
+    tmp = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
     info->white_y = tmp / 100000.0;
-    im_png_read_bytes_and_reverse(info, &tmp, 4);
+    tmp = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
     info->red_x = tmp / 100000.0;
-    im_png_read_bytes_and_reverse(info, &tmp, 4);
+    tmp = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
     info->red_y = tmp / 100000.0;
-    im_png_read_bytes_and_reverse(info, &tmp, 4);
+    tmp = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
     info->green_x = tmp / 100000.0;
-    im_png_read_bytes_and_reverse(info, &tmp, 4);
+    tmp = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
     info->green_y = tmp / 100000.0;
-    im_png_read_bytes_and_reverse(info, &tmp, 4);
+    tmp = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
     info->blue_x = tmp / 100000.0;
-    im_png_read_bytes_and_reverse(info, &tmp, 4);
+    tmp = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
     info->blue_y = tmp / 100000.0;
     printf("white_x = %.5f\n", info->white_x);
     printf("white_y = %.5f\n", info->white_y);
@@ -522,189 +499,138 @@ void im_png_parse_chunk_cHRM(im_png_info *info) {
     printf("blue_x = %.5f\n", info->blue_x);
     printf("blue_y = %.5f\n", info->blue_y);
 
-    uint32_t crc;
-    im_png_read_bytes_and_reverse(info, &crc, PNG_CHUNK_CRC_LEN);
+    uint32_t *crc = (uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
 }
 
 void im_png_parse_chunk_bKGD(im_png_info *info) {
-    uint32_t bKGD_data_len = 0;
-    im_png_read_bytes_and_reverse(info, &bKGD_data_len, PNG_CHUNK_DATA_LEN); /* this is guarunteed to be 13 in the spec, but we read anyway so that we don't fuck up the offset. */
-    printf("bKGD_data_length: %d\n", bKGD_data_len);
 
-    char bKGD_chunk_type[4];
-    im_png_read_bytes(info, &bKGD_chunk_type, PNG_CHUNK_TYPE_LEN);
-    printf("chunk type: ");
-    printf("%.*s\n", PNG_CHUNK_TYPE_LEN, bKGD_chunk_type);
+    uint32_t length = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
+    printf("bKGD_data_length: %d\n", length);
+
+    char *chunk_type = (char*)consume(&info->at, info->end_of_file, sizeof(uint32_t));
+    printf("chunk_type: %.*s\n", PNG_CHUNK_TYPE_LEN, chunk_type);
 
     switch(info->color_type) {
         case 0:
         case 4: {
             #ifndef IM_NO_ERRORS
-            if(bKGD_data_len != 2u){
-                IM_ERR("For color type %d, data len is supposed to be 2. data_len is: %d.", info->color_type, bKGD_data_len);
+            if(length != 2u){
+                IM_ERR("For color type %d, data len is supposed to be 2. data_len is: %d.", info->color_type, length);
             }
             #endif
-            im_png_read_bytes_and_reverse(info, &info->bkgd_gray, 2); /* 2-byte big-endian */
+            info->bkgd_gray = *(uint16_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint16_t));
             break;
         }
         case 2:
         case 6: {
             #ifndef IM_NO_ERRORS
-            if(bKGD_data_len != 6u){
-                IM_ERR("For color type %d, data_len is supposed to be 6. data_len is: %d.", info->color_type, bKGD_data_len);
+            if(length != 6u){
+                IM_ERR("For color type %d, data_len is supposed to be 6. data_len is: %d.", info->color_type, length);
             }
             #endif
-            im_png_read_bytes_and_reverse(info, &info->bkgd_r, 2);
-            im_png_read_bytes_and_reverse(info, &info->bkgd_g, 2);
-            im_png_read_bytes_and_reverse(info, &info->bkgd_b, 2);
+            info->bkgd_r = *(uint16_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint16_t));
+            info->bkgd_g = *(uint16_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint16_t));
+            info->bkgd_b = *(uint16_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint16_t));
             break;
         }
         case 3: {
             #ifndef IM_NO_ERRORS
-            if(bKGD_data_len != 1u){
-                IM_ERR("For color type 3, data_len is supposed to be 1. data_len is: %d.", bKGD_data_len);
+            if(length != 1u){
+                IM_ERR("For color type 3, data_len is supposed to be 1. data_len is: %d.", length);
             }
             #endif
-            im_png_read_bytes(info, &info->bkgd_palette_idx, 1);
+            info->bkgd_palette_idx = *(uint8_t*)consume(&info->at, info->end_of_file, sizeof(uint8_t));
             break;
         }
     }
 
-    uint32_t crc;
-    im_png_read_bytes_and_reverse(info, &crc, PNG_CHUNK_CRC_LEN);
+
+    uint32_t *crc = (uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
 }
 
 void im_png_parse_chunk_tIME(im_png_info *info) {
-    uint32_t tIME_data_len = 0;
-    im_png_read_bytes_and_reverse(info, &tIME_data_len, PNG_CHUNK_DATA_LEN); /* this is guarunteed to be 13 in the spec, but we read anyway so that we don't fuck up the offset. */
-    printf("tIME_data_length: %d\n", tIME_data_len);
-    if(tIME_data_len != 7u){
+
+    uint32_t length = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
+    printf("tIME_data_length: %d\n", length);
+    if(length != 7u){
         IM_ERR("Length section of tIME chunk is not 13.");
     }
 
-    char tIME_chunk_type[4];
-    im_png_read_bytes(info, &tIME_chunk_type, PNG_CHUNK_TYPE_LEN);
-    printf("chunk type: ");
-    printf("%.*s\n", PNG_CHUNK_TYPE_LEN, tIME_chunk_type);
+    char *chunk_type = (char*)consume(&info->at, info->end_of_file, sizeof(uint32_t));
+    printf("chunk_type: %.*s\n", PNG_CHUNK_TYPE_LEN, chunk_type);
 
-    im_png_read_bytes_and_reverse(info, &info->year, 2);
-    im_png_read_bytes_and_reverse(info, &info->month, 1);
-    im_png_read_bytes_and_reverse(info, &info->day, 1);
-    im_png_read_bytes_and_reverse(info, &info->hour, 1);
-    im_png_read_bytes_and_reverse(info, &info->minute, 1);
-    im_png_read_bytes_and_reverse(info, &info->second, 1);
+    info->year = *(uint16_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint16_t));
+    info->month = *(uint8_t*)consume(&info->at, info->end_of_file, sizeof(uint8_t));
+    info->day = *(uint8_t*)consume(&info->at, info->end_of_file, sizeof(uint8_t));
+    info->hour = *(uint8_t*)consume(&info->at, info->end_of_file, sizeof(uint8_t));
+    info->minute = *(uint8_t*)consume(&info->at, info->end_of_file, sizeof(uint8_t));
+    info->second = *(uint8_t*)consume(&info->at, info->end_of_file, sizeof(uint8_t));
 
-    uint32_t crc;
-    im_png_read_bytes_and_reverse(info, &crc, PNG_CHUNK_CRC_LEN);
+    uint32_t *crc = (uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
 }
 
-void im_png_parse_chunk_IDAT(im_png_info *info) {
-    uint32_t IDAT_data_len = 0;
-    im_png_read_bytes_and_reverse(info, &IDAT_data_len, PNG_CHUNK_DATA_LEN);
-    printf("IDAT_data_length: %d\n", IDAT_data_len);
+void im_png_parse_chunk_tEXt(im_png_info *info) {
 
-    char IDAT_chunk_type[4];
-    im_png_read_bytes(info, &IDAT_chunk_type, PNG_CHUNK_TYPE_LEN);
-    printf("chunk type: ");
-    printf("%.*s\n", PNG_CHUNK_TYPE_LEN, IDAT_chunk_type);
+    uint32_t length = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
+    printf("tEXT_data_length: %d\n", length);
 
-    if(info->compression_method == 0) {
-        if(info->idat_count == 0) {
-
-
-            info->idat_count++;;
-
-            /* we skip the first two bytes of the first IDAT chunk because the first two bytes don't contain any compressed data. */
-        }
-    }
-
-    uint32_t crc;
-    im_png_read_bytes_and_reverse(info, &crc, PNG_CHUNK_CRC_LEN);
-    printf("ihdr_crc: ");
-    im_png_print_bytes(&crc, PNG_CHUNK_CRC_LEN);
-}
-
-void im_png_parse_chunk_tEXT(im_png_info *info) {
-    uint32_t tEXT_data_len = 0;
-    im_png_read_bytes_and_reverse(info, &tEXT_data_len, PNG_CHUNK_DATA_LEN);
-    printf("tEXT_data_length: %d\n", tEXT_data_len);
-
-    char tEXT_chunk_type[4];
-    im_png_read_bytes(info, &tEXT_chunk_type, PNG_CHUNK_TYPE_LEN);
-    printf("chunk type: %.*s\n", PNG_CHUNK_TYPE_LEN, tEXT_chunk_type);
+    char *chunk_type = (char*)consume(&info->at, info->end_of_file, sizeof(uint32_t));
+    printf("chunk_type: %.*s\n", PNG_CHUNK_TYPE_LEN, chunk_type);
 
     char keyword[80] = {0};
     char at = 0;
     int counter = 0;
     do {
         if(counter >= 79) break;
-        im_png_read_bytes(info, &at, 1);
+        at = *(char*)consume(&info->at, info->end_of_file, 1);
         keyword[counter++] = at;
     } while(at != '\0');
 
-    size_t text_len = tEXT_data_len - counter;
-    char *text = (char*)malloc(text_len + 1);
-    im_png_read_bytes(info, text, text_len);
-    text[text_len] = '\0';
+    size_t text_len = length - counter;
+    char *text = (char*)consume(&info->at, info->end_of_file, 1);
+    consume(&info->at, info->end_of_file, text_len - 1);
 
-    printf("keyword: %s\n", keyword);
-    printf("Text: %s\n", text);
+    printf("%s %.*s\n", keyword, text_len, text);
 
-    free(text);
-
-    uint32_t crc;
-    im_png_read_bytes_and_reverse(info, &crc, PNG_CHUNK_CRC_LEN);
+    uint32_t *crc = (uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
 }
 
 void im_png_parse_chunk_IEND(im_png_info *info) {
-    uint32_t IEND_data_len = 0;
-    im_png_read_bytes_and_reverse(info, &IEND_data_len, PNG_CHUNK_DATA_LEN); /* this is guarunteed to be 13 in the spec, but we read anyway so that we don't fuck up the offset. */
-    printf("IEND_data_length: %d\n", IEND_data_len);
-    if(IEND_data_len != 0u){
+
+    uint32_t length = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
+    printf("IEND_data_length: %d\n", length);
+    if(length != 0u){
         IM_ERR("Length section of IEND chunk is not 0.");
     }
 
-    char IEND_chunk_type[4];
-    im_png_read_bytes(info, &IEND_chunk_type, PNG_CHUNK_TYPE_LEN);
-    printf("chunk type: ");
-    printf("%.*s\n", PNG_CHUNK_TYPE_LEN, IEND_chunk_type);
+    char *chunk_type = (char*)consume(&info->at, info->end_of_file, sizeof(uint32_t));
+    printf("chunk_type: %.*s\n", PNG_CHUNK_TYPE_LEN, chunk_type);
 
-    uint32_t crc;
-    im_png_read_bytes_and_reverse(info, &crc, PNG_CHUNK_CRC_LEN);
-}
 
-char *get_next_chunk(im_png_info *info) {
-    if(info->png_file + info->bytes_read < info->png_file + info->file_size) {
-        return info->png_file + info->bytes_read;
-    } else {
-        fprintf(stderr, "Error: %s() Tried to get next chunk after end of file", __func__);
-        return NULL;
-    }
+    uint32_t *crc = (uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
 }
 
 char *get_next_chunk_type(im_png_info *info) {
-    if(info->png_file + info->bytes_read < info->png_file + info->file_size) {
-        return info->png_file + info->bytes_read + PNG_CHUNK_DATA_LEN;
+    if(info->at + PNG_CHUNK_DATA_LEN < info->end_of_file) {
+        return info->at + PNG_CHUNK_DATA_LEN;
     } else {
         fprintf(stderr, "Error: %s() Tried to get next chunk after end of file", __func__);
         return NULL;
     }
 }
 
+/* Skip the chunk length(4 bytes), chunk type (4 bytes), chunk data, and CRC (4 bytes) */
 void skip_chunk(im_png_info *info) {
-    uint32_t length_be = 0;
-    im_png_read_bytes(info, &length_be, 4);
-    im_png_reverse_bytes(&length_be, 4);
+    uint32_t *length = (uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
 
-    /* Skip the chunk type (4 bytes), chunk data (length_be bytes), and CRC (4 bytes) */
-    size_t bytes_to_skip = PNG_CHUNK_TYPE_LEN + length_be + PNG_CHUNK_CRC_LEN;
+    size_t bytes_needed_to_skip_chunk = PNG_CHUNK_TYPE_LEN + *length + PNG_CHUNK_CRC_LEN;
 
     /* Advance the offset */
-    info->bytes_read += bytes_to_skip;
+    info->at += bytes_needed_to_skip_chunk;
 }
 
 void im_png_peek_bytes(im_png_info *info, void* buf, char *offset, const size_t bytes_to_read) {
-    if(offset < info->png_file + info->file_size) {
+    if(offset < info->end_of_file) {
         im_memcpy(buf, offset, bytes_to_read);
     } else {
         fprintf(stderr, "Error: %s(): tried to read bytes past end of file, not going to read.", __func__);
@@ -714,7 +640,7 @@ void im_png_peek_bytes(im_png_info *info, void* buf, char *offset, const size_t 
 char* im_png_peek_next_chunk(im_png_info *info, char *current_chunk) {
     uint32_t data_length = 0;
     im_png_peek_bytes(info, &data_length, current_chunk, PNG_CHUNK_DATA_LEN);
-    im_png_reverse_bytes(&data_length, PNG_CHUNK_DATA_LEN);
+    endian_swap(&data_length);
     printf("DATA LENGTH: %d\n", data_length);
 
     return current_chunk + PNG_CHUNK_DATA_LEN + PNG_CHUNK_TYPE_LEN + data_length + PNG_CHUNK_CRC_LEN;
@@ -723,9 +649,9 @@ char* im_png_peek_next_chunk(im_png_info *info, char *current_chunk) {
 typedef struct {
     uint8_t *data;
     size_t bitpos; /* bit offset from start */
-} im__bitstream;
+} im_bitsream;
 
-uint32_t consume_bits(im__bitstream *bs, int n) {
+uint32_t consume_bits(im_bitsream *bs, int n) {
     uint32_t val = 0;
     for (int i = 0; i < n; i++) {
         size_t byte_index = bs->bitpos / 8;
@@ -736,7 +662,7 @@ uint32_t consume_bits(im__bitstream *bs, int n) {
     return val;
 }
 
-void align_next_byte(im__bitstream *bs) {
+void align_next_byte(im_bitsream *bs) {
     size_t bits_out_of_alignment = bs->bitpos & 7;
     if(bits_out_of_alignment) {
         consume_bits(bs, 8 - bits_out_of_alignment);
@@ -956,7 +882,7 @@ static const uint8_t distance_extra[30] = {
 };
 
 // Decode a symbol from fixed Huffman literal/length tree
-int decode_fixed_literal_length(im__bitstream *bs) {
+int decode_fixed_literal_length(im_bitsream *bs) {
     uint32_t code = 0;
     
     // Read 7 bits first
@@ -992,7 +918,7 @@ int decode_fixed_literal_length(im__bitstream *bs) {
 }
 
 // Decode a distance code from fixed Huffman distance tree
-int decode_fixed_distance(im__bitstream *bs) {
+int decode_fixed_distance(im_bitsream *bs) {
     // All distance codes are 5 bits in fixed Huffman
     uint32_t code = 0;
     for (int i = 0; i < 5; i++) {
@@ -1044,7 +970,7 @@ void build_huffman_tree(huffman_tree *tree, uint8_t *lengths, int count) {
 }
 
 
-int decode_symbol(im__bitstream *bs, huffman_tree *tree, int max_symbols) {
+int decode_symbol(im_bitsream *bs, huffman_tree *tree, int max_symbols) {
     uint32_t code = 0;
     size_t start_pos = bs->bitpos;
     
@@ -1082,7 +1008,7 @@ char *im_png_decompress(im_png_info *info, char *current_IDAT_chunk, size_t *ida
     while(*(uint32_t*)(current_IDAT_chunk + PNG_CHUNK_DATA_LEN) == CHUNK_IDAT) {
 
         im_memcpy(&tmp, current_IDAT_chunk, PNG_CHUNK_DATA_LEN);
-        im_png_reverse_bytes(&tmp, PNG_CHUNK_DATA_LEN);
+        endian_swap(&tmp);
         printf(" THE FUCKING DATA LENGTH: %d\n", tmp);
 
         comp_data_size += tmp;
@@ -1102,7 +1028,7 @@ char *im_png_decompress(im_png_info *info, char *current_IDAT_chunk, size_t *ida
     current_IDAT_chunk = start;
     while (*(uint32_t*)(current_IDAT_chunk + 4) == CHUNK_IDAT) {
         im_memcpy(&current_chunk_data_len, current_IDAT_chunk, PNG_CHUNK_DATA_LEN);
-        im_png_reverse_bytes(&current_chunk_data_len, PNG_CHUNK_DATA_LEN);
+        endian_swap(&current_chunk_data_len);
 
         im_memcpy(compressed_data + offset, current_IDAT_chunk + PNG_CHUNK_DATA_LEN + PNG_CHUNK_TYPE_LEN, current_chunk_data_len);
         offset += current_chunk_data_len;
@@ -1133,7 +1059,7 @@ char *im_png_decompress(im_png_info *info, char *current_IDAT_chunk, size_t *ida
 
     if (((cmf << 8) + flg) % 31 == 0) {
         printf("Info: Integrity check successful!\ndecompressing...\n");
-        size_t bytes_per_scanline = im__ceil(info->width * info->channel_count * info->bits_per_channel, 8);
+        size_t bytes_per_scanline = im_ceil(info->width * info->channel_count * info->bits_per_channel, 8);
         size_t image_size_after_decompression = info->height * (bytes_per_scanline + 1); /* +1 per scanline for filter byte */
         info->png_pixels = malloc(image_size_after_decompression);
         struct {
@@ -1141,7 +1067,7 @@ char *im_png_decompress(im_png_info *info, char *current_IDAT_chunk, size_t *ida
             uint8_t BTYPE;
         }block_header;
         size_t offset = 0;
-        im__bitstream bs = { (uint8_t*)compressed_data, 0 };
+        im_bitsream bs = { (uint8_t*)compressed_data, 0 };
         do {
             block_header.BFINAL = consume_bits(&bs, 1);
             block_header.BTYPE = consume_bits(&bs, 2);
@@ -1392,16 +1318,25 @@ char *im_png_decompress(im_png_info *info, char *current_IDAT_chunk, size_t *ida
     return info->png_pixels;
 }
 
+typedef struct {
+    uint32_t length;
+    uint32_t type;
+}im_png_header;
+
+typedef struct {
+    uint32_t crc;
+}im_png_footer;
+
 unsigned char *im_png_load(char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
 
     im_png_info info = {0};
     info.first_ihdr = im_true;
     info.png_file = image_file;
-    info.file_size = file_size;
+    info.at = image_file;
 
-    im_png_read_bytes(&info, 0, 8);
-    printf("png_sig: ");
-    im_png_print_bytes(info.png_file, PNG_SIG_LEN);
+    info.end_of_file = image_file + file_size;
+    char *png_sig = (char*)consume(&info.at, info.end_of_file, sizeof(png_sig));
+    im_png_print_bytes(png_sig, PNG_SIG_LEN);
 
     char *next_chunk_type = NULL;
     next_chunk_type = get_next_chunk_type(&info);
@@ -1452,7 +1387,6 @@ unsigned char *im_png_load(char *image_file, size_t file_size, int *width, int *
             case CHUNK_IDAT: {
                 size_t idat_chunk_count = 0;
                 im_png_decompress(&info, next_chunk_type - PNG_CHUNK_DATA_LEN, &idat_chunk_count);
-                /*im_png_parse_chunk_IDAT(&info); */
                 for(int i = 0; i < idat_chunk_count; i++) {
                     skip_chunk(&info);
                 }
@@ -1463,7 +1397,7 @@ unsigned char *im_png_load(char *image_file, size_t file_size, int *width, int *
                 skip_chunk(&info);
                 break;
             case CHUNK_tEXt:
-                im_png_parse_chunk_tEXT(&info);
+                im_png_parse_chunk_tEXt(&info);
                 printf("-----------------------------\n");
                 break;
             case CHUNK_zTXt:
