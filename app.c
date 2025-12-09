@@ -17,15 +17,23 @@ int main(int argc, char **argv) {
 
     int image_width, image_height, nr_channels;
     unsigned char *image = im_load(file_path, &image_width, &image_height, &nr_channels, 0);
+
     pal_init();
-    pal_window *window = pal_create_window(800, 600, "image_viewer", 0);
+    int window_width = 800, window_height = 600;
+    pal_window *window = pal_create_window(window_width, window_height, "image_viewer", 0);
     int running = 1;
     pal_event event;
     pal_vec4 bg_color = {1.0f, 1.0f, 1.0f, 1.0f};
 
     while(running) {
         while(pal_poll_events(&event)) {
-
+            switch(event.type) {
+                case PAL_EVENT_WINDOW_RESIZED:
+                    window_width = event.window.width;
+                    window_height = event.window.height;
+                    printf("%d", event.window.width);
+                    break;
+            }
         }
 
         if(pal_is_key_pressed(-1, PAL_SCAN_ESCAPE) || pal_is_key_pressed(-1, PAL_SCAN_CAPSLOCK)) {
@@ -37,16 +45,17 @@ int main(int argc, char **argv) {
         for(int y = 0; y < image_height; y++) {
             for(int x = 0; x < image_width; x++) {
                 /* PBM_TEST */
-#if 0
-                pal_vec4 color;
-                color.r = (float)image[img_pixel_idx];
-                color.g = (float)image[img_pixel_idx];
-                color.b = (float)image[img_pixel_idx];
-                color.a = (float)image[img_pixel_idx];
+                pal_vec4 color = {0};
+                color.r = (float)image[img_pixel_idx] / 255.0f;
                 img_pixel_idx++;
+                color.g = (float)image[img_pixel_idx] / 255.0f;
+                img_pixel_idx++;
+                color.b = (float)image[img_pixel_idx] / 255.0f;
+                img_pixel_idx++;
+                printf("pixel: %zu: %f, %f, %f, \n", img_pixel_idx, color.r, color.g, color.b);
                 pal_draw_rect(window, x + 400, y + 300, 1, 1, color);
 
-#endif
+#if 0
                 // Read source color from PNG
                 float src_r = (float)image[img_pixel_idx++] / 255.0f;
                 float src_g = (float)image[img_pixel_idx++] / 255.0f;
@@ -60,7 +69,8 @@ int main(int argc, char **argv) {
                 color.b = src_b * src_a + bg_color.b * (1.0f - src_a);
                 color.a = 1.0f; // Fully opaque after blending
                 
-                pal_draw_rect(window, x + 400, y + 300, 1, 1, color);
+                pal_draw_rect(window, x + window_width / 2, y + window_height / 2, 1, 1, color);
+#endif
             }
         }
     }

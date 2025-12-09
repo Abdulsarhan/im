@@ -341,6 +341,7 @@ void im_png_print_string(const char* str, size_t len) {
 }
 
 //#define consume(at, end_of_file, size) (consume_size(at, end_of_file, size))
+
 void *consume(char **at, char *end_of_file, size_t size) {
     void *orig = *at;
     if(*at + size <= end_of_file) {
@@ -1423,52 +1424,52 @@ unsigned char *im_png_load(char *image_file, size_t file_size, int *width, int *
     return info.png_pixels;
 }
 
-static int consume_byte(char **current_pos, char *end_of_file) {
-    if (*current_pos < end_of_file) {
-        return *(*current_pos)++;
+static char consume_byte(char **at, char *end_of_file) {
+    char *orig = *at;
+    if(*at < end_of_file) {
+        *at += 1;
+        return *orig;
     }
-    return -1; /* EOF indicator */
+    fprintf(stderr, "Error: %s(), will not read past end of file.\n", __func__);
+    return 0;  // Return 0 on error, which will stop the while loop
 }
 
-static int peek_byte(char *current_pos, char *end_of_file) {
+/* peeks the current byte without consuming it */
+static char peek_byte(char *current_pos, char *end_of_file) {
     if (current_pos < end_of_file) {
         return *current_pos;
     }
-    return -1; /* EOF indicator */
+    fprintf(stderr, "Error: %s(), will not peek past end of file.", __func__);
+    return *current_pos;
 }
 
-unsigned char *im_p1_load(char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
-    if (!image_file || file_size < 3) return NULL;
+im_bool is_end_of_line(char ch) {
+    return ch == '\n' || ch == '\r';
+}
+
+unsigned char *im_parse_pnm_ascii_header(char *at, char *end_of_file, int *width, int *height) {
+
+    /* skip sig */
+    consume(&at, end_of_file, 2);
     
-    char *at = image_file;
-    char *end_of_file = image_file + file_size;
-    unsigned char *pixels = NULL;
-    unsigned char *pixel_write_pos = NULL;
-    *num_channels = 1;
-    *width = 0;
-    *height = 0;
-    
-    consume_byte(&at, end_of_file); /* skip 'P' */
-    consume_byte(&at, end_of_file); /* skip '1' */
-    
-    /* skip whitespace after P1 */
-    int c;
-    while ((c = peek_byte(at, end_of_file)) != -1 && (c == ' ' || c == '\n' || c == '\r' || c == '\t')) {
+    /* eat whitespaces after sig */
+    char c = 0;
+    while ((c = peek_byte(at, end_of_file)) && (c == ' ' || c == '\n' || c == '\r' || c == '\t')) {
         consume_byte(&at, end_of_file);
     }
     
-    /* skip comment lines */
-    while (peek_byte(at, end_of_file) == '#') {
-        while ((c = consume_byte(&at, end_of_file)) != -1 && c != '\n') {
-            /* consume comment */
-        }
-        /* skip whitespace after comment */
-        while ((c = peek_byte(at, end_of_file)) != -1 && (c == ' ' || c == '\r' || c == '\t')) {
-            consume_byte(&at, end_of_file);
+    /* eat comments after whitespaces*/
+
+    while(*at == '#') {
+        if(peek_byte(at, end_of_file) == '#') {
+            char byte = 0;
+            do{
+                byte = consume_byte(&at, end_of_file);
+            }while(!is_end_of_line(byte));
         }
     }
-    
-    /* parse width */
+
+    /* Get width */
     c = peek_byte(at, end_of_file);
     if (c >= '0' && c <= '9') {
         int value = 0;
@@ -1481,12 +1482,12 @@ unsigned char *im_p1_load(char *image_file, size_t file_size, int *width, int *h
         return NULL;
     }
     
-    /* skip whitespace between width and height */
-    while ((c = peek_byte(at, end_of_file)) != -1 && (c == ' ' || c == '\t')) {
+    /* skip whitespace characters between width and height */
+    while ((c = peek_byte(at, end_of_file)) && (c == ' ' || c == '\t')) {
         consume_byte(&at, end_of_file);
     }
     
-    /* parse height */
+    /* Get height */
     c = peek_byte(at, end_of_file);
     if (c >= '0' && c <= '9') {
         int value = 0;
@@ -1499,26 +1500,38 @@ unsigned char *im_p1_load(char *image_file, size_t file_size, int *width, int *h
         return NULL;
     }
     
-    /* validate dimensions */
+    /* width and height sanity check */
     if (*width <= 0 || *height <= 0 || *width > 100000 || *height > 100000) {
         return NULL;
     }
     
-    /* allocate pixel buffer */
+    /* skip whitespaces and new line characters after width and height */
+    while ((c = peek_byte(at, end_of_file)) && (c == ' ' || c == '\n' || c == '\r' || c == '\t')) {
+        consume_byte(&at, end_of_file);
+    }
+    return at;
+}
+
+unsigned char *im_p1_load(char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
+    char *at = image_file;
+    char *end_of_file = image_file + file_size;
+    unsigned char *pixels = NULL;
+    unsigned char *pixel_write_pos = NULL;
+    size_t pixels_written = 0;
+    *num_channels = 1;
+    *width = 0;
+    *height = 0;
+    
+    at = im_parse_pnm_ascii_header(at, end_of_file, width, height);
+    
     size_t pixel_count = (size_t)(*width) * (*height);
     pixels = malloc(pixel_count);
     if (!pixels) return NULL;
-    
     pixel_write_pos = pixels;
-    size_t pixels_written = 0;
-    
-    /* skip to start of pixel data */
-    while ((c = peek_byte(at, end_of_file)) != -1 && (c == ' ' || c == '\n' || c == '\r' || c == '\t')) {
-        consume_byte(&at, end_of_file);
-    }
-    
-    /* parse pixel data */
-    while ((c = consume_byte(&at, end_of_file)) != -1 && pixels_written < pixel_count) {
+    pixels_written = 0;
+    char c = 0;
+
+    while((c = consume_byte(&at, end_of_file)) && pixels_written < pixel_count) {
         if (c == '0') {
             *pixel_write_pos++ = 0;    /* white */
             pixels_written++;
@@ -1529,17 +1542,128 @@ unsigned char *im_p1_load(char *image_file, size_t file_size, int *width, int *h
         }
         /* else skip whitespace and other characters */
     }
-
     return pixels;
 }
 
-unsigned char *im_pgm_ascii_load(char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
-    image_file += 2;
+unsigned char *im_p2_load(char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
+    char *at = image_file;
+    char *end_of_file = image_file + file_size;
+    unsigned char *pixels = NULL;
+    *num_channels = 1;
+    *width = 0;
+    *height = 0;
+    
+    at = im_parse_pnm_ascii_header(at, end_of_file, width, height);
 
+    char c = 0;
+    int max_val = 0;
+
+    /* get the max val */
+    c = peek_byte(at, end_of_file);
+    if (c >= '0' && c <= '9') {
+        while ((c = peek_byte(at, end_of_file)) >= '0' && c <= '9') {
+            max_val = max_val * 10 + (c - '0');
+            consume_byte(&at, end_of_file);
+        }
+    } else {
+        return NULL;
+    }
+    float multiplication_factor = 255.0f / (float)max_val;
+    /* skip white space after the max val */
+    while ((c = peek_byte(at, end_of_file)) && (c == ' ' || c == '\n' || c == '\r' || c == '\t')) {
+        consume_byte(&at, end_of_file);
+    }
+
+    size_t pixel_count = (size_t)(*width) * (*height);
+    pixels = malloc(pixel_count);
+    if (!pixels) return NULL;
+
+    for (size_t i = 0; i < pixel_count; i++) {
+
+            while ((c = peek_byte(at, end_of_file)) &&
+                  (c == ' ' || c == '\n' || c == '\r' || c == '\t')) {
+                consume_byte(&at, end_of_file);
+            }
+
+            int value = 0;
+
+            c = peek_byte(at, end_of_file);
+            if (c < '0' || c > '9') return NULL;
+
+            while ((c = peek_byte(at, end_of_file)) >= '0' && c <= '9') {
+                value = value * 10 + (c - '0');
+                consume_byte(&at, end_of_file);
+            }
+
+            value = (int)(value * multiplication_factor);
+
+            pixels[i] = (unsigned char)value;
+    }
+    return pixels;
 }
 
-unsigned char *im_ppm_ascii_load(char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
-    image_file += 2; /* ignore sig */
+unsigned char *im_p3_load(char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
+    char *at = image_file;
+    char *end_of_file = image_file + file_size;
+    unsigned char *pixels = NULL;
+    unsigned char *pixel_write_pos = NULL;
+    size_t pixels_written = 0;
+    *num_channels = 3;
+    *width = 0;
+    *height = 0;
+    
+    at = im_parse_pnm_ascii_header(at, end_of_file, width, height);
+
+    char c = 0;
+    int max_val = 0;
+
+    /* get the max val */
+    c = peek_byte(at, end_of_file);
+    if (c >= '0' && c <= '9') {
+        while ((c = peek_byte(at, end_of_file)) >= '0' && c <= '9') {
+            max_val = max_val * 10 + (c - '0');
+            consume_byte(&at, end_of_file);
+        }
+    } else {
+        return NULL;
+    }
+
+    float multiplication_factor = 255.0f / (float)max_val;
+
+    /* skip white space after the max val */
+    while ((c = peek_byte(at, end_of_file)) && (c == ' ' || c == '\n' || c == '\r' || c == '\t')) {
+        consume_byte(&at, end_of_file);
+    }
+
+    size_t pixel_count = (size_t)(*width) * (*height);
+    pixels = malloc(pixel_count * 3);
+    if (!pixels) return NULL;
+
+    pixels_written = 0;
+
+    for (size_t i = 0; i < pixel_count; i++) {
+        for(size_t j = 0; j < 3; j++) {
+            while ((c = peek_byte(at, end_of_file)) &&
+                  (c == ' ' || c == '\n' || c == '\r' || c == '\t')) {
+                consume_byte(&at, end_of_file);
+            }
+
+            int value = 0;
+
+            c = peek_byte(at, end_of_file);
+            if (c < '0' || c > '9') return NULL;
+
+            while ((c = peek_byte(at, end_of_file)) >= '0' && c <= '9') {
+                value = value * 10 + (c - '0');
+                consume_byte(&at, end_of_file);
+            }
+
+            value = (int)(value * multiplication_factor);
+
+            pixels[i*3 + j] = (unsigned char)value;
+        }
+    }
+    return pixels;
 }
 
 IM_API unsigned char *im_load(const char *image_path, int *width, int *height, int *number_of_channels, int desired_channels) {
@@ -1565,9 +1689,9 @@ IM_API unsigned char *im_load(const char *image_path, int *width, int *height, i
     } else if(im_memcmp(file_sig, "P1", 2) == 0) {
         return im_p1_load(image_file, file_size, width, height, number_of_channels, desired_channels);
     } else if(im_memcmp(file_sig, "P2", 2) == 0) {
-        return im_pgm_ascii_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+        return im_p2_load(image_file, file_size, width, height, number_of_channels, desired_channels);
     } else if(im_memcmp(file_sig, "P3", 2) == 0) {
-        return im_ppm_ascii_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+        return im_p3_load(image_file, file_size, width, height, number_of_channels, desired_channels);
     } else {
         return NULL;
     }
@@ -1576,4 +1700,4 @@ IM_API unsigned char *im_load(const char *image_path, int *width, int *height, i
     return NULL;
 }
 
-#endif // IM_IMPLEMENTATION
+#endif // IM_IMPL
