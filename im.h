@@ -82,7 +82,6 @@ typedef signed   long long int64_t;
     do { \
         printf("[ERROR] "); \
         printf(__VA_ARGS__); \
-        printf("Corrupt Png."); \
         printf("\n"); \
     } while(0)
 #define IM_ERR(...) IM_ERROR(__VA_ARGS__)
@@ -615,7 +614,7 @@ char *get_next_chunk_type(im_png_info *info) {
     if(info->at + PNG_CHUNK_DATA_LEN < info->end_of_file) {
         return info->at + PNG_CHUNK_DATA_LEN;
     } else {
-        fprintf(stderr, "Error: %s() Tried to get next chunk after end of file", __func__);
+        IM_ERROR("Tried to read png chunk after end of file. Malformed PNG. Not going to load.");
         return NULL;
     }
 }
@@ -1083,7 +1082,8 @@ char *im_png_decompress(im_png_info *info, char *current_IDAT_chunk, size_t *ida
                     uint16_t nlen = consume_bits(&bs, 16);
 
                     if ((len ^ nlen) != 0xFFFF) {
-                        IM_ERR("Corrupted stored block!\n");
+                        IM_ERR("Corrupted block! Png is malformed. Not going to load png.\n");
+                        return NULL;
                     }
                     for (uint16_t i = 0; i < len; i++) {
                         info->png_pixels[offset++] = (uint8_t)consume_bits(&bs, 8);
@@ -1341,9 +1341,11 @@ unsigned char *im_png_load(char *image_file, size_t file_size, int *width, int *
 
     char *next_chunk_type = NULL;
     next_chunk_type = get_next_chunk_type(&info);
+    if(!next_chunk_type) return NULL;
 
     while(*(uint32_t*)next_chunk_type != CHUNK_IEND) {
         next_chunk_type = get_next_chunk_type(&info);
+        if(!next_chunk_type) return NULL;
         printf("chunk: %.*s\n", 4, next_chunk_type);
         switch(*(uint32_t*)next_chunk_type)  {
             case CHUNK_IHDR:
@@ -1387,7 +1389,8 @@ unsigned char *im_png_load(char *image_file, size_t file_size, int *width, int *
                 break;
             case CHUNK_IDAT: {
                 size_t idat_chunk_count = 0;
-                im_png_decompress(&info, next_chunk_type - PNG_CHUNK_DATA_LEN, &idat_chunk_count);
+                char *err = im_png_decompress(&info, next_chunk_type - PNG_CHUNK_DATA_LEN, &idat_chunk_count);
+                if(!err) return NULL;
                 for(int i = 0; i < idat_chunk_count; i++) {
                     skip_chunk(&info);
                 }
@@ -1450,7 +1453,7 @@ im_bool is_end_of_line(char ch) {
 char *im_parse_pnm_ascii_header(char *at, char *end_of_file, int *width, int *height) {
 
     /* skip sig */
-    consume(&at, end_of_file, 2);
+    char *sig = consume(&at, end_of_file, 2);
 
     /* eat whitespaces after sig */
     char c = 0;
@@ -1479,6 +1482,7 @@ char *im_parse_pnm_ascii_header(char *at, char *end_of_file, int *width, int *he
         }
         *width = value;
     } else {
+        IM_ERR("Could not get the width of the image because the width is not\nwhere we expected it to be in the file. Malformed image. Not going to load.");
         return NULL;
     }
 
@@ -1497,11 +1501,28 @@ char *im_parse_pnm_ascii_header(char *at, char *end_of_file, int *width, int *he
         }
         *height = value;
     } else {
+        IM_ERR("Could not get the height of the image because the height is not\nwhere we expected it to be in the file. Malformed image. Not going to load.");
         return NULL;
     }
 
-    /* width and height sanity check */
-    if (*width <= 0 || *height <= 0 || *width > 100000 || *height > 100000) {
+    /* width and height sanity checks */
+    if (*width <= 0 ) {
+        IM_ERR("The width of the image is less than or equal to 0.\n Not going to load the image.");
+        return NULL;
+    }
+
+    if(*height <= 0) {
+        IM_ERR("The height of the image is less than or equal to 0.\n Not going to load the image.");
+        return NULL;
+    }
+
+    if(*width > 100000) {
+        IM_ERR("The width of the image is a stupidly large number (bigger than 100,000).\n Not going to load the image.");
+        return NULL;
+    }
+
+    if (*height > 100000) {
+        IM_ERR("The height of the image is a stupidly large number (bigger than 100,000).\n Not going to load the image.");
         return NULL;
     }
 
@@ -1523,6 +1544,7 @@ unsigned char *im_p1_load(char *image_file, size_t file_size, int *width, int *h
     *height = 0;
 
     at = im_parse_pnm_ascii_header(at, end_of_file, width, height);
+    if (!at) return NULL;
 
     size_t pixel_count = (size_t)(*width) * (*height);
     pixels = malloc(pixel_count);

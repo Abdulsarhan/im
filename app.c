@@ -17,6 +17,7 @@ int main(int argc, char **argv) {
 
     int image_width, image_height, nr_channels;
     unsigned char *image = im_load(file_path, &image_width, &image_height, &nr_channels, 0);
+    if(!image) return 0;
 
     pal_init();
     int window_width = 800, window_height = 600;
