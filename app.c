@@ -44,18 +44,17 @@ int main(int argc, char **argv) {
 
         for(int y = 0; y < image_height; y++) {
             for(int x = 0; x < image_width; x++) {
+#if 0
                 /* PBM_TEST */
                 pal_vec4 color = {0};
                 color.r = (float)image[img_pixel_idx] / 255.0f;
-                img_pixel_idx++;
                 color.g = (float)image[img_pixel_idx] / 255.0f;
-                img_pixel_idx++;
                 color.b = (float)image[img_pixel_idx] / 255.0f;
                 img_pixel_idx++;
                 printf("pixel: %zu: %f, %f, %f, \n", img_pixel_idx, color.r, color.g, color.b);
                 pal_draw_rect(window, x + 400, y + 300, 1, 1, color);
 
-#if 0
+#endif
                 // Read source color from PNG
                 float src_r = (float)image[img_pixel_idx++] / 255.0f;
                 float src_g = (float)image[img_pixel_idx++] / 255.0f;
@@ -70,7 +69,6 @@ int main(int argc, char **argv) {
                 color.a = 1.0f; // Fully opaque after blending
                 
                 pal_draw_rect(window, x + window_width / 2, y + window_height / 2, 1, 1, color);
-#endif
             }
         }
     }
