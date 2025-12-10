@@ -77,6 +77,7 @@ typedef signed   long long int64_t;
 #endif
 
 
+/* The IM_ERR macro does not work if you try to split up the macro across multiple lines */
 #ifndef IM_NO_ERRORS
 #define IM_ERROR(...) \
     do { \
@@ -1805,6 +1806,421 @@ unsigned char *im_p6_load(char *image_file, size_t file_size, int *width, int *h
     return pixels;
 }
 
+unsigned char *im_psd_load(char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
+    char *at = image_file;
+    char *end_of_file = image_file + file_size;
+    char *sig = consume(&at, end_of_file, 4);
+    printf("psd_sig: %.*s\n", 4, sig);
+}
+
+
+typedef struct color_coords {
+  int32_t x;
+  int32_t y;
+  int32_t z;
+} color_coords;
+
+typedef struct px_clr_crds {
+    color_coords red;
+    color_coords green;
+    color_coords blue;
+} px_clr_crds;
+
+typedef struct rgb_quad {
+  uint8_t blue;
+  uint8_t green;
+  uint8_t red;
+  uint8_t reserved;
+} rgb_quad;
+
+enum {
+    BMP_COMP_RGB = 0x0000,
+    BMP_COMP_RLE8 = 0x0001,
+    BMP_COMP_RLE4 = 0x0002,
+    BMP_COMP_BITFIELDS = 0x0003,
+    BMP_COMP_JPEG = 0x0004,
+    BMP_COMP_PNG = 0x0005,
+    BMP_COMP_CMYK = 0x000B,
+    BMP_COMP_CMYKRLE8 = 0x000C,
+    BMP_COMP_CMYKRLE4 = 0x000D
+}im_bmp_compression;
+
+enum {
+    BMP_CLRSPACE_GAMMA_AND_ENDPOINTS_PROVIDED = 0x00000000,
+    BMP_CLRSPACE_SRGB = 0x73524742,
+    BMP_CLRSPACE_WINDOWS = 0x57696E20
+}im_bmp_logical_color_space;
+
+enum {
+    BMP_CLRSPACE_IN_OTHER_FILE = 0x4C494E4B,
+    BMP_CLRSPACE_IN_SAME_FILE = 0x4D424544
+}im_bmp_logical_color_space_v5;
+
+#define BMP_BITCOUNT_SPECIFIED_BY_PNG_OR_JPEG 0
+#define BMP_BITCOUNT_MONOCHROME 1
+#define BMP_BITCOUNT_16_COLOR_PALETTE 4
+#define BMP_BITCOUNT_256_COLOR_PALETTE 8
+#define BMP_BITCOUNT_RGB_16 16
+#define BMP_BITCOUNT_RGB_24 24
+#define BMP_BITCOUNT_RGB_32 32
+
+#define BMP_HEADER_TYPE_CORE 12
+#define BMP_HEADER_TYPE_OS2_64 64
+#define BMP_HEADER_TYPE_OS2_16 16
+#define BMP_HEADER_TYPE_V1 40
+#define BMP_HEADER_TYPE_V2 52
+#define BMP_HEADER_TYPE_V3 56
+#define BMP_HEADER_TYPE_V4 108
+#define BMP_HEADER_TYPE_V5 124
+
+typedef struct bitmap_file_header {
+  uint16_t type;
+  uint32_t size;
+  uint16_t reserved1;
+  uint16_t reserved2;
+  uint32_t bitmap_offset;
+} bitmap_file_header;
+
+typedef struct bitmap_header_core {
+    uint32_t struct_size;
+    uint16_t width;
+    uint16_t height;
+    uint16_t num_planes;
+    uint16_t bit_count;
+} bitmap_header_core;
+
+typedef struct bitmap_header_os2_16 {
+    uint32_t struct_size;
+    uint32_t width;
+    uint32_t height;
+    uint16_t num_planes;
+    uint16_t bit_count;
+} bitmap_header_os2_16;
+
+typedef struct bitmap_header_os2_64 {
+    uint32_t struct_size;
+    uint32_t width;
+    uint32_t height;
+    uint16_t num_planes;
+    uint16_t bit_count;
+    uint32_t compression_format;
+    uint32_t image_size;
+    uint32_t pixels_per_meter_x;
+    uint32_t pixels_per_meter_y;
+    uint32_t num_color_indices;
+    uint32_t num_required_color_indices;
+
+    uint16_t bc2ResUnit;
+    uint16_t bc2Reserved;
+    uint16_t bc2Orientation;
+    uint16_t bc2Halftoning;
+    uint32_t bc2HalftoneSize1;
+    uint32_t bc2HalftoneSize2;
+    uint32_t bc2ColorSpace;
+    uint32_t bc2AppData;
+} bitmap_header_os2_64;
+
+typedef struct bitmap_header_v1 {
+  uint32_t struct_size;
+  int32_t  width;
+  int32_t  height;
+  uint16_t  num_planes;
+  uint16_t  bit_count;
+  uint32_t compression_format;
+  uint32_t image_size;
+  int32_t  pixels_per_meter_x;
+  int32_t  pixels_per_meter_y;
+  uint32_t num_color_indices;
+  uint32_t num_required_color_indices;
+} bitmap_header_v1;
+
+typedef struct bitmap_header_v2 {
+  uint32_t struct_size;
+  int32_t  width;
+  int32_t  height;
+  uint16_t num_planes;
+  uint16_t bit_count;
+  uint32_t compression_format;
+  uint32_t image_size;
+  int32_t  pixels_per_meter_x;
+  int32_t  pixels_per_meter_y;
+  uint32_t num_color_indices;
+  uint32_t num_required_color_indices;
+  /* these masks are used to extract pixels from the image if the compression is BI_COMP_BITFIELDS */
+  uint32_t red_mask;
+  uint32_t green_mask;
+  uint32_t blue_mask;
+} bitmap_header_v2;
+
+typedef struct bitmap_header_v3 {
+  uint32_t struct_size;
+  int32_t  width;
+  int32_t  height;
+  uint16_t num_planes;
+  uint16_t bit_count;
+  uint32_t compression_format;
+  uint32_t image_size;
+  int32_t  pixels_per_meter_x;
+  int32_t  pixels_per_meter_y;
+  uint32_t num_color_indices;
+  uint32_t num_required_color_indices;
+  /* these masks are used to extract pixels from the image if the compression is BI_COMP_BITFIELDS */
+  uint32_t red_mask;
+  uint32_t green_mask;
+  uint32_t blue_mask;
+  uint32_t alpha_mask;
+} bitmap_header_v3;
+
+typedef struct bitmap_header_v4 {
+  uint32_t     struct_size;
+  int32_t      width;
+  int32_t      height;
+  uint16_t     num_planes;
+  uint16_t     bit_count;
+  uint32_t     compression_format;
+  uint32_t     image_size;
+  int32_t      pixels_per_meter_x;
+  int32_t      pixels_per_meter_y;
+  uint32_t     num_color_indices;
+  uint32_t     num_required_color_indices;
+  /* these masks are used to extract pixels from the image if the compression is BI_COMP_BITFIELDS */
+  uint32_t     red_mask;
+  uint32_t     green_mask;
+  uint32_t     blue_mask;
+  uint32_t     alpha_mask;
+  uint32_t     colorspace;
+  px_clr_crds colorspace_endpoints;
+  uint32_t     gamma_red;
+  uint32_t     gamma_green;
+  uint32_t     gamma_blue;
+} bitmap_header_v4;
+
+typedef struct {
+  uint32_t     struct_size;
+  int32_t      width;
+  int32_t      height;
+  uint16_t     num_planes; /* must be 1 */
+  uint16_t     bit_count;
+  uint32_t     compression_format;
+  uint32_t     image_size; /* docs say that this is the size of the image buffer if there is JPEG or PNG compression. Not sure if that means size before or after compression */
+  int32_t      pixels_per_meter_x;
+  int32_t      pixels_per_meter_y;
+  uint32_t     num_color_indices; /* specifies number of colors in the pallete. If zero, the image is not palletized */
+  uint32_t     num_required_color_indices;
+  /* these masks are used to extract pixels from the image if the compression is BI_COMP_BITFIELDS */
+  uint32_t     red_mask;
+  uint32_t     green_mask;
+  uint32_t     blue_mask;
+  uint32_t     alpha_mask;
+
+  uint32_t     colorspace;
+  px_clr_crds  colorspace_endpoints;
+  uint32_t     gamma_red;
+  uint32_t     gamma_green;
+  uint32_t     gamma_blue;
+  uint32_t     rendering_intent;
+  uint32_t     color_profile_data;
+  uint32_t     color_profile_size;
+  uint32_t     reserved;
+} bitmap_header_v5;
+
+size_t load_bmp_start(char **at, char *end_of_file, int *width, int *height) {
+    bitmap_header_os2_16 *header;
+    header = (bitmap_header_os2_16*)consume(at, end_of_file, sizeof(bitmap_header_os2_16));
+    *width = header->width;
+    *height = header->height;
+    if(header->num_planes != 1) {
+        IM_ERR("Expected num_planes to be 1, but it's not. We will assume that the rest of the file is not corrupted.");
+    }
+
+    size_t bits_per_pixel = 0;
+
+    switch(header->bit_count) {
+        case BMP_BITCOUNT_SPECIFIED_BY_PNG_OR_JPEG:
+            break;
+
+        case BMP_BITCOUNT_MONOCHROME:
+            bits_per_pixel = 1;
+            break;
+
+        case BMP_BITCOUNT_16_COLOR_PALETTE:
+            bits_per_pixel = 4;
+            break;
+
+        case BMP_BITCOUNT_256_COLOR_PALETTE:
+            bits_per_pixel = 8;
+            break;
+
+        case BMP_BITCOUNT_RGB_16: /* five bits for red, five for green and five for blue. Last bit is not used */
+            bits_per_pixel = 5;
+            break;
+
+        case BMP_BITCOUNT_RGB_24:
+            bits_per_pixel = 8;
+            break;
+
+        case BMP_BITCOUNT_RGB_32:
+            bits_per_pixel = 8; /* The high byte is reserved (for god knows what).*/
+            break;
+    }
+    return bits_per_pixel;
+}
+
+unsigned char *im_bmp_load(char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
+    char *at = image_file;
+    char *end_of_file = image_file + file_size;
+
+    bitmap_file_header file_header;
+    file_header.type = *(uint16_t*)consume(&at, end_of_file, (sizeof(uint16_t)));
+    file_header.size = *(uint32_t*)consume(&at, end_of_file, (sizeof(uint32_t)));
+    file_header.reserved1 = *(uint16_t*)consume(&at, end_of_file, sizeof(uint16_t));
+    file_header.reserved2 = *(uint16_t*)consume(&at, end_of_file, sizeof(uint16_t));
+    file_header.bitmap_offset = *(uint32_t*)consume(&at, end_of_file, sizeof(uint32_t));
+
+    if(file_header.size != (uint32_t)file_size) {
+        IM_ERR("File size mentioned in bitmap header does not match the file size that we got from windows.\nWe will assume that the rest of the file is not corrupted.");
+    }
+    if(file_header.reserved1 != 0) {
+        IM_ERR("Reserved byte expected to be 0, but is not 0. We will assume that the rest of the file is not corrupted.");
+    }
+    if(file_header.reserved2 != 0) {
+        IM_ERR("Reserved byte expected to be 0, but is not 0. We will assume that the rest of the file is not corrupted.");
+    }
+    /* Because this file format got multiple revisions, we will just refer to the header
+       that comes after the BITMAPFILEHEADER as the "dib_header". */
+
+    if(file_header.bitmap_offset < (uint32_t)sizeof(bitmap_file_header)) {
+        IM_ERR("Offset is an unreasonably small number. Corrupt .bmp. Not going to decode.");
+        return NULL;
+    } else {
+        printf("size of file_header: %zu\n", sizeof(bitmap_file_header));
+        printf("Offset from start of header: %d\n", file_header.bitmap_offset);
+    }
+
+    uint32_t *dib_header_size = (uint32_t*)at; /* this is jank, and unsafe. We should have a peek funciton */
+
+    switch(*dib_header_size) {
+        /* the reason why we can't use load_bmp_start on the first case
+           is that the width and the height fields in bitmap_header_core
+           are different in size to the width and height fields of
+           the other header types. uint16_t vs uint32_t
+       */
+        case BMP_HEADER_TYPE_CORE: {
+            bitmap_header_core header;
+            header = *(bitmap_header_core*)consume(&at, end_of_file, sizeof(bitmap_header_core));
+            *width = header.width;
+            *height = header.height;
+
+            size_t bits_per_pixel = 0;
+            switch(header.bit_count) { /* this value can only be 1, 4, 8 or 24 in a bitmap_header_core */
+                case BMP_BITCOUNT_SPECIFIED_BY_PNG_OR_JPEG:
+                    /* BMP_HEADER_TYPE_CORE does not support compression.*/
+                    IM_ERR("Could not get the number of bits per pixel in image.\nMalformed .bmp. Not going to load");
+                    bits_per_pixel = 0; /* The high byte is reserved (for god knows what).*/
+                    return NULL;
+                    break;
+
+                case BMP_BITCOUNT_MONOCHROME:
+                    bits_per_pixel = 1;
+                    break;
+
+                case BMP_BITCOUNT_16_COLOR_PALETTE:
+                    bits_per_pixel = 4;
+                    break;
+
+                case BMP_BITCOUNT_256_COLOR_PALETTE:
+                    bits_per_pixel = 8;
+                    break;
+
+                case BMP_BITCOUNT_RGB_16: /* five bits for red, five for green and five for blue. Last bit is not used */
+                    IM_ERR("Could not get the number of bits per pixel in image.\nMalformed .bmp. Not going to load");
+                    bits_per_pixel = 0; /* The high byte is reserved (for god knows what).*/
+                    return NULL;
+                    break;
+
+                case BMP_BITCOUNT_RGB_24:
+                    bits_per_pixel = 24;
+                    break;
+
+                case BMP_BITCOUNT_RGB_32:
+                    IM_ERR("Could not get the number of bits per pixel in image.\nMalformed .bmp. Not going to load");
+                    bits_per_pixel = 0; /* The high byte is reserved (for god knows what).*/
+                    return NULL;
+                    break;
+            }
+            unsigned char *pixel_offset = image_file + file_header.bitmap_offset;
+
+            size_t bytes_per_pixel = bits_per_pixel / 8; /* will be 3 for 24-bpp */
+            size_t data_per_row = header.width * bytes_per_pixel;
+
+            /* stride: row size rounded up to 4-byte boundary */
+            size_t stride = ((data_per_row + 3) / 4) * 4;
+            size_t padding = stride - data_per_row;
+
+            size_t total_bytes = stride * header.height;
+
+            unsigned char *output_pixels = malloc(header.width * header.height * bytes_per_pixel);
+            if (!output_pixels) return NULL;
+
+            unsigned char *in = pixel_offset;
+            unsigned char *out = output_pixels;
+
+            for (int row = 0; row < header.height; ++row) {
+                /* WORKING TOP-DOWN: if BMP is bottom-up, you'd read rows in reverse order */
+                memcpy(out, in, data_per_row);
+                in  += stride;
+                out += data_per_row;
+            }
+            return out;
+            break;
+
+        }
+        case BMP_HEADER_TYPE_OS2_16: {
+            size_t bits_per_pixel = load_bmp_start(&at, end_of_file, width, height);
+            size_t row_size = ((bits_per_pixel * (*width) + 31) / 32) * 4;
+            break;
+        }
+        case BMP_HEADER_TYPE_V1: {
+            size_t bits_per_pixel = load_bmp_start(&at, end_of_file, width, height);
+            size_t row_size = ((bits_per_pixel * (*width) + 31) / 32) * 4;
+            uint32_t *compression_format = (uint32_t*)consume(&at, end_of_file, sizeof(uint32_t));
+            break;
+        }
+        case BMP_HEADER_TYPE_V2: {
+            size_t bits_per_pixel = load_bmp_start(&at, end_of_file, width, height);
+            size_t row_size = ((bits_per_pixel * (*width) + 31) / 32) * 4;
+            uint32_t *compression_format = (uint32_t*)consume(&at, end_of_file, sizeof(uint32_t));
+            break;
+        }
+        case BMP_HEADER_TYPE_V3: {
+            size_t bits_per_pixel = load_bmp_start(&at, end_of_file, width, height);
+            size_t row_size = ((bits_per_pixel * (*width) + 31) / 32) * 4;
+            uint32_t *compression_format = (uint32_t*)consume(&at, end_of_file, sizeof(uint32_t));
+            break;
+        }
+        case BMP_HEADER_TYPE_OS2_64: {
+            size_t bits_per_pixel = load_bmp_start(&at, end_of_file, width, height);
+            size_t row_size = ((bits_per_pixel * (*width) + 31) / 32) * 4;
+            uint32_t *compression_format = (uint32_t*)consume(&at, end_of_file, sizeof(uint32_t));
+            break;
+        }
+        case BMP_HEADER_TYPE_V4: {
+            size_t bits_per_pixel = load_bmp_start(&at, end_of_file, width, height);
+            size_t row_size = ((bits_per_pixel * (*width) + 31) / 32) * 4;
+            uint32_t *compression_format = (uint32_t*)consume(&at, end_of_file, sizeof(uint32_t));
+            break;
+        }
+        case BMP_HEADER_TYPE_V5: {
+            size_t bits_per_pixel = load_bmp_start(&at, end_of_file, width, height);
+            size_t row_size = ((bits_per_pixel * (*width) + 31) / 32) * 4;
+            uint32_t *compression_format = (uint32_t*)consume(&at, end_of_file, sizeof(uint32_t));
+            break;
+        }
+    }
+
+    return NULL;
+}
+
 IM_API unsigned char *im_load(const char *image_path, int *width, int *height, int *number_of_channels, int desired_channels) {
 
     size_t file_size = 0;
@@ -1834,6 +2250,10 @@ IM_API unsigned char *im_load(const char *image_path, int *width, int *height, i
 
     if(im_memcmp(im_png_sig, file_sig, PNG_SIG_LEN) == 0) {
         return im_png_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+    } else if(im_memcmp(file_sig, "BM", 2) == 0) {
+        return im_bmp_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+    } else if(im_memcmp(file_sig, "8BPS", 4) == 0) {
+        return im_psd_load(image_file, file_size, width, height, number_of_channels, desired_channels);
     } else if(im_memcmp(file_sig, "P1", 2) == 0) {
         return im_p1_load(image_file, file_size, width, height, number_of_channels, desired_channels);
     } else if(im_memcmp(file_sig, "P2", 2) == 0) {
