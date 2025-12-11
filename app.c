@@ -57,6 +57,14 @@ int main(int argc, char **argv) {
 
 #endif
                 // Read source color from PNG
+                pal_vec4 color;
+                color.r = (float)image[img_pixel_idx++] / 255.0f;
+                color.g = (float)image[img_pixel_idx++] / 255.0f;
+                color.b = (float)image[img_pixel_idx++] / 255.0f;
+                color.a =  255.0f;
+                pal_draw_rect(window, x + window_width / 2, y + window_height / 2, 1, 1, color);
+#if 0
+                /* PNG_TEST */
                 float src_r = (float)image[img_pixel_idx++] / 255.0f;
                 float src_g = (float)image[img_pixel_idx++] / 255.0f;
                 float src_b = (float)image[img_pixel_idx++] / 255.0f;
@@ -70,6 +78,7 @@ int main(int argc, char **argv) {
                 color.a = 1.0f; // Fully opaque after blending
                 
                 pal_draw_rect(window, x + window_width / 2, y + window_height / 2, 1, 1, color);
+#endif
             }
         }
     }

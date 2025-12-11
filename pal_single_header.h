@@ -7219,9 +7219,6 @@ PALAPI pal_window *pal_create_window(int width, int height, const char *window_t
     int screen = DefaultScreen(g_display);
 
     /* --- Default graphics API to OpenGL if none specified --- */
-    if (!(flags & (PAL_WINDOW_OPENGL | PAL_WINDOW_VULKAN | PAL_WINDOW_METAL))) {
-        flags |= PAL_WINDOW_OPENGL;
-    }
 
     GLXFBConfig fb = 0;
     XVisualInfo visual_info;

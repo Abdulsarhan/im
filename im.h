@@ -369,15 +369,23 @@ size_t im_ceil(size_t x, size_t y) {
     return (x + y - 1) / y;
 }
 
+typedef struct {
+    uint32_t length;
+    uint32_t chunk_type;
+}im_png_chunk_header;
+
+typedef struct {
+    uint32_t crc;
+}im_png_footer;
+
 void im_png_parse_chunk_IHDR(im_png_info *info) {
-    uint32_t length = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
-    printf("Length: %d\n", length);
-    if(length != 13u){
+    im_png_chunk_header header = *(im_png_chunk_header*)consume(&info->at, info->end_of_file, sizeof(im_png_chunk_header));
+    endian_swap((uint32_t*)&header);
+
+    printf("Length: %d\n", header.length);
+    if(header.length != 13u){
         IM_ERR("Length section of ihdr chunk is not 13.");
     }
-
-    char *chunk_type = (char*)consume(&info->at, info->end_of_file, sizeof(uint32_t));
-    printf("chunk_type: %.*s\n", 4, chunk_type);
 
     if(!info->first_ihdr) IM_ERR("Multiple IHDR.");
 
@@ -448,14 +456,12 @@ void im_png_parse_chunk_IHDR(im_png_info *info) {
 }
 
  void im_png_parse_chunk_gAMA(im_png_info *info) {
-    uint32_t length = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
-    printf("gAMA_data_length: %d\n", length);
-    if(length != 4u){
+    im_png_chunk_header header = *(im_png_chunk_header*)consume(&info->at, info->end_of_file, sizeof(im_png_chunk_header));
+    endian_swap((uint32_t*)&header);
+
+    if(header.length != 4u){
         IM_ERR("Length section of gAMA chunk is not 4.");
     }
-
-    char *chunk_type = (char*)consume(&info->at, info->end_of_file, sizeof(uint32_t));
-    printf("chunk_type: %.*s\n", PNG_CHUNK_TYPE_LEN, chunk_type);
 
     uint32_t tmp  = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
     info->gamma = tmp / 100000.0;
@@ -465,14 +471,12 @@ void im_png_parse_chunk_IHDR(im_png_info *info) {
 }
 
 void im_png_parse_chunk_cHRM(im_png_info *info) {
-    uint32_t length = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
-    printf("cHRM_data_length: %d\n", length);
-    if(length != 32u){
+    im_png_chunk_header header = *(im_png_chunk_header*)consume(&info->at, info->end_of_file, sizeof(im_png_chunk_header));
+    endian_swap((uint32_t*)&header);
+
+    if(header.length != 32u){
         IM_ERR("Length section of cHRM chunk is not 32.");
     }
-
-    char *chunk_type = (char*)consume(&info->at, info->end_of_file, sizeof(uint32_t));
-    printf("chunk_type: %.*s\n", PNG_CHUNK_TYPE_LEN, chunk_type);
 
     uint32_t tmp;
     tmp = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
@@ -504,19 +508,15 @@ void im_png_parse_chunk_cHRM(im_png_info *info) {
 }
 
 void im_png_parse_chunk_bKGD(im_png_info *info) {
-
-    uint32_t length = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
-    printf("bKGD_data_length: %d\n", length);
-
-    char *chunk_type = (char*)consume(&info->at, info->end_of_file, sizeof(uint32_t));
-    printf("chunk_type: %.*s\n", PNG_CHUNK_TYPE_LEN, chunk_type);
+    im_png_chunk_header header = *(im_png_chunk_header*)consume(&info->at, info->end_of_file, sizeof(im_png_chunk_header));
+    endian_swap((uint32_t*)&header);
 
     switch(info->color_type) {
         case 0:
         case 4: {
             #ifndef IM_NO_ERRORS
-            if(length != 2u){
-                IM_ERR("For color type %d, data len is supposed to be 2. data_len is: %d.", info->color_type, length);
+            if(header.length != 2u){
+                IM_ERR("For color type %d, data len is supposed to be 2. data_len is: %d.", info->color_type, header.length);
             }
             #endif
             info->bkgd_gray = *(uint16_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint16_t));
@@ -525,8 +525,8 @@ void im_png_parse_chunk_bKGD(im_png_info *info) {
         case 2:
         case 6: {
             #ifndef IM_NO_ERRORS
-            if(length != 6u){
-                IM_ERR("For color type %d, data_len is supposed to be 6. data_len is: %d.", info->color_type, length);
+            if(header.length != 6u){
+                IM_ERR("For color type %d, data_len is supposed to be 6. data_len is: %d.", info->color_type, header.length);
             }
             #endif
             info->bkgd_r = *(uint16_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint16_t));
@@ -536,8 +536,8 @@ void im_png_parse_chunk_bKGD(im_png_info *info) {
         }
         case 3: {
             #ifndef IM_NO_ERRORS
-            if(length != 1u){
-                IM_ERR("For color type 3, data_len is supposed to be 1. data_len is: %d.", length);
+            if(header.length != 1u){
+                IM_ERR("For color type 3, data_len is supposed to be 1. data_len is: %d.", header.length);
             }
             #endif
             info->bkgd_palette_idx = *(uint8_t*)consume(&info->at, info->end_of_file, sizeof(uint8_t));
@@ -545,20 +545,16 @@ void im_png_parse_chunk_bKGD(im_png_info *info) {
         }
     }
 
-
     uint32_t *crc = (uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
 }
 
 void im_png_parse_chunk_tIME(im_png_info *info) {
+    im_png_chunk_header header = *(im_png_chunk_header*)consume(&info->at, info->end_of_file, sizeof(im_png_chunk_header));
+    endian_swap((uint32_t*)&header);
 
-    uint32_t length = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
-    printf("tIME_data_length: %d\n", length);
-    if(length != 7u){
+    if(header.length != 7u){
         IM_ERR("Length section of tIME chunk is not 13.");
     }
-
-    char *chunk_type = (char*)consume(&info->at, info->end_of_file, sizeof(uint32_t));
-    printf("chunk_type: %.*s\n", PNG_CHUNK_TYPE_LEN, chunk_type);
 
     info->year = *(uint16_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint16_t));
     info->month = *(uint8_t*)consume(&info->at, info->end_of_file, sizeof(uint8_t));
@@ -571,12 +567,8 @@ void im_png_parse_chunk_tIME(im_png_info *info) {
 }
 
 void im_png_parse_chunk_tEXt(im_png_info *info) {
-
-    uint32_t length = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
-    printf("tEXT_data_length: %d\n", length);
-
-    char *chunk_type = (char*)consume(&info->at, info->end_of_file, sizeof(uint32_t));
-    printf("chunk_type: %.*s\n", PNG_CHUNK_TYPE_LEN, chunk_type);
+    im_png_chunk_header header = *(im_png_chunk_header*)consume(&info->at, info->end_of_file, sizeof(im_png_chunk_header));
+    endian_swap((uint32_t*)&header);
 
     char keyword[80] = {0};
     char at = 0;
@@ -587,7 +579,7 @@ void im_png_parse_chunk_tEXt(im_png_info *info) {
         keyword[counter++] = at;
     } while(at != '\0');
 
-    size_t text_len = length - counter;
+    size_t text_len = header.length - counter;
     char *text = (char*)consume(&info->at, info->end_of_file, 1);
     consume(&info->at, info->end_of_file, text_len - 1);
 
@@ -597,16 +589,12 @@ void im_png_parse_chunk_tEXt(im_png_info *info) {
 }
 
 void im_png_parse_chunk_IEND(im_png_info *info) {
+    im_png_chunk_header header = *(im_png_chunk_header*)consume(&info->at, info->end_of_file, sizeof(im_png_chunk_header));
+    endian_swap((uint32_t*)&header);
 
-    uint32_t length = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
-    printf("IEND_data_length: %d\n", length);
-    if(length != 0u){
+    if(header.length != 0u){
         IM_ERR("Length section of IEND chunk is not 0.");
     }
-
-    char *chunk_type = (char*)consume(&info->at, info->end_of_file, sizeof(uint32_t));
-    printf("chunk_type: %.*s\n", PNG_CHUNK_TYPE_LEN, chunk_type);
-
 
     uint32_t *crc = (uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
 }
@@ -1320,15 +1308,6 @@ char *im_png_decompress(im_png_info *info, char *current_IDAT_chunk, size_t *ida
     return info->png_pixels;
 }
 
-typedef struct {
-    uint32_t length;
-    uint32_t type;
-}im_png_header;
-
-typedef struct {
-    uint32_t crc;
-}im_png_footer;
-
 unsigned char *im_png_load(char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
 
     im_png_info info = {0};
@@ -2033,37 +2012,98 @@ size_t load_bmp_start(char **at, char *end_of_file, int *width, int *height) {
         IM_ERR("Expected num_planes to be 1, but it's not. We will assume that the rest of the file is not corrupted.");
     }
 
-    size_t bits_per_pixel = 0;
+    return header->bit_count;
+}
 
-    switch(header->bit_count) {
-        case BMP_BITCOUNT_SPECIFIED_BY_PNG_OR_JPEG:
-            break;
 
-        case BMP_BITCOUNT_MONOCHROME:
-            bits_per_pixel = 1;
-            break;
+unsigned char *im_bmp_copy_data(unsigned char *pixel_offset, int width, int height, int bits_per_pixel, uint32_t compression_format) {
+    if (width == 0 || height == 0) return NULL;
+    int abs_height = (height < 0) ? -height : height;
 
-        case BMP_BITCOUNT_16_COLOR_PALETTE:
-            bits_per_pixel = 4;
-            break;
+    size_t bytes_per_pixel = bits_per_pixel / 8;
+    size_t data_per_row    = width * bytes_per_pixel;
 
-        case BMP_BITCOUNT_256_COLOR_PALETTE:
-            bits_per_pixel = 8;
-            break;
+    /* BMP rows are padded to 4 bytes */
+    size_t stride = ((data_per_row + 3) / 4) * 4;
 
-        case BMP_BITCOUNT_RGB_16: /* five bits for red, five for green and five for blue. Last bit is not used */
-            bits_per_pixel = 5;
-            break;
+    unsigned char *output_pixels = malloc((size_t)width * abs_height * bytes_per_pixel);
+    if (!output_pixels) return NULL;
 
-        case BMP_BITCOUNT_RGB_24:
-            bits_per_pixel = 8;
-            break;
+    unsigned char *in  = pixel_offset;
+    unsigned char *out = output_pixels;
 
-        case BMP_BITCOUNT_RGB_32:
-            bits_per_pixel = 8; /* The high byte is reserved (for god knows what).*/
+    switch (bits_per_pixel) {
+        case 0:
             break;
+        case 1:
+            break;
+        case 2:
+            break;
+        case 4:
+            break;
+        case 8:
+            break;
+        case 16:
+            break;
+        case 24: /* BGR → RGB */
+        case 32: { /*BGRA -> RGBA */
+            int top_down = (height < 0);
+
+            for (int row = 0; row < abs_height; ++row) {
+                unsigned char *dst_row;
+
+                if (top_down) {
+                    dst_row = out + row * data_per_row;    /* natural order */
+                } else {
+                    dst_row = out + (abs_height - 1 - row) * data_per_row; /* reversed */
+                }
+
+                unsigned char *src = in;
+                unsigned char *dst = dst_row;
+
+                if (bytes_per_pixel == 3) {
+                    /* --- B G R → R G B --- */
+                    for (int x = 0; x < width; ++x) {
+                        unsigned char b = src[0];
+                        unsigned char g = src[1];
+                        unsigned char r = src[2];
+
+                        dst[0] = r;
+                        dst[1] = g;
+                        dst[2] = b;
+
+                        src += 3;
+                        dst += 3;
+                    }
+                } else if (bytes_per_pixel == 4) {
+                    /* --- B G R X → R G B 255 --- */
+                    for (int x = 0; x < width; ++x) {
+                        unsigned char b = src[0];
+                        unsigned char g = src[1];
+                        unsigned char r = src[2];
+                        /* src[3] is reserved / undefined */
+
+                        dst[0] = r;
+                        dst[1] = g;
+                        dst[2] = b;
+                        dst[3] = 255;   /* opaque alpha */
+
+                        src += 4;
+                        dst += 4;
+                    }
+                }
+
+                in += stride;
+            }
+            break;
+        }
+
+        default:
+            free(output_pixels);
+            return NULL;
     }
-    return bits_per_pixel;
+
+    return output_pixels;
 }
 
 unsigned char *im_bmp_load(char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
@@ -2076,6 +2116,7 @@ unsigned char *im_bmp_load(char *image_file, size_t file_size, int *width, int *
     file_header.reserved1 = *(uint16_t*)consume(&at, end_of_file, sizeof(uint16_t));
     file_header.reserved2 = *(uint16_t*)consume(&at, end_of_file, sizeof(uint16_t));
     file_header.bitmap_offset = *(uint32_t*)consume(&at, end_of_file, sizeof(uint32_t));
+    unsigned char *pixel_offset = image_file + file_header.bitmap_offset;
 
     if(file_header.size != (uint32_t)file_size) {
         IM_ERR("File size mentioned in bitmap header does not match the file size that we got from windows.\nWe will assume that the rest of the file is not corrupted.");
@@ -2103,117 +2144,53 @@ unsigned char *im_bmp_load(char *image_file, size_t file_size, int *width, int *
         /* the reason why we can't use load_bmp_start on the first case
            is that the width and the height fields in bitmap_header_core
            are different in size to the width and height fields of
-           the other header types. uint16_t vs uint32_t
+           the other header types. uint16_t vs uint32_t yes, the later headers are int32_t, but they fit in the same number of bytes.
        */
         case BMP_HEADER_TYPE_CORE: {
             bitmap_header_core header;
             header = *(bitmap_header_core*)consume(&at, end_of_file, sizeof(bitmap_header_core));
             *width = header.width;
             *height = header.height;
-
-            size_t bits_per_pixel = 0;
-            switch(header.bit_count) { /* this value can only be 1, 4, 8 or 24 in a bitmap_header_core */
-                case BMP_BITCOUNT_SPECIFIED_BY_PNG_OR_JPEG:
-                    /* BMP_HEADER_TYPE_CORE does not support compression.*/
-                    IM_ERR("Could not get the number of bits per pixel in image.\nMalformed .bmp. Not going to load");
-                    bits_per_pixel = 0; /* The high byte is reserved (for god knows what).*/
-                    return NULL;
-                    break;
-
-                case BMP_BITCOUNT_MONOCHROME:
-                    bits_per_pixel = 1;
-                    break;
-
-                case BMP_BITCOUNT_16_COLOR_PALETTE:
-                    bits_per_pixel = 4;
-                    break;
-
-                case BMP_BITCOUNT_256_COLOR_PALETTE:
-                    bits_per_pixel = 8;
-                    break;
-
-                case BMP_BITCOUNT_RGB_16: /* five bits for red, five for green and five for blue. Last bit is not used */
-                    IM_ERR("Could not get the number of bits per pixel in image.\nMalformed .bmp. Not going to load");
-                    bits_per_pixel = 0; /* The high byte is reserved (for god knows what).*/
-                    return NULL;
-                    break;
-
-                case BMP_BITCOUNT_RGB_24:
-                    bits_per_pixel = 24;
-                    break;
-
-                case BMP_BITCOUNT_RGB_32:
-                    IM_ERR("Could not get the number of bits per pixel in image.\nMalformed .bmp. Not going to load");
-                    bits_per_pixel = 0; /* The high byte is reserved (for god knows what).*/
-                    return NULL;
-                    break;
-            }
-            unsigned char *pixel_offset = image_file + file_header.bitmap_offset;
-
-            size_t bytes_per_pixel = bits_per_pixel / 8; /* will be 3 for 24-bpp */
-            size_t data_per_row = header.width * bytes_per_pixel;
-
-            /* stride: row size rounded up to 4-byte boundary */
-            size_t stride = ((data_per_row + 3) / 4) * 4;
-            size_t padding = stride - data_per_row;
-
-            size_t total_bytes = stride * header.height;
-
-            unsigned char *output_pixels = malloc(header.width * header.height * bytes_per_pixel);
-            if (!output_pixels) return NULL;
-
-            unsigned char *in = pixel_offset;
-            unsigned char *out = output_pixels;
-
-            for (int row = 0; row < header.height; ++row) {
-                /* WORKING TOP-DOWN: if BMP is bottom-up, you'd read rows in reverse order */
-                memcpy(out, in, data_per_row);
-                in  += stride;
-                out += data_per_row;
-            }
-            return out;
-            break;
-
+            return im_bmp_copy_data(pixel_offset, *width, *height, header.bit_count, 0);
         }
         case BMP_HEADER_TYPE_OS2_16: {
             size_t bits_per_pixel = load_bmp_start(&at, end_of_file, width, height);
-            size_t row_size = ((bits_per_pixel * (*width) + 31) / 32) * 4;
-            break;
+            return im_bmp_copy_data(pixel_offset, *width, *height, bits_per_pixel, 0);
         }
         case BMP_HEADER_TYPE_V1: {
             size_t bits_per_pixel = load_bmp_start(&at, end_of_file, width, height);
-            size_t row_size = ((bits_per_pixel * (*width) + 31) / 32) * 4;
-            uint32_t *compression_format = (uint32_t*)consume(&at, end_of_file, sizeof(uint32_t));
+            uint32_t compression_format = *(uint32_t*)consume(&at, end_of_file, sizeof(uint32_t));
+            return im_bmp_copy_data(pixel_offset, *width, *height, bits_per_pixel, compression_format);
             break;
         }
         case BMP_HEADER_TYPE_V2: {
             size_t bits_per_pixel = load_bmp_start(&at, end_of_file, width, height);
-            size_t row_size = ((bits_per_pixel * (*width) + 31) / 32) * 4;
-            uint32_t *compression_format = (uint32_t*)consume(&at, end_of_file, sizeof(uint32_t));
+            uint32_t compression_format = *(uint32_t*)consume(&at, end_of_file, sizeof(uint32_t));
+            return im_bmp_copy_data(pixel_offset, *width, *height, bits_per_pixel, compression_format);
             break;
         }
         case BMP_HEADER_TYPE_V3: {
             size_t bits_per_pixel = load_bmp_start(&at, end_of_file, width, height);
-            size_t row_size = ((bits_per_pixel * (*width) + 31) / 32) * 4;
-            uint32_t *compression_format = (uint32_t*)consume(&at, end_of_file, sizeof(uint32_t));
+            uint32_t compression_format = *(uint32_t*)consume(&at, end_of_file, sizeof(uint32_t));
+            return im_bmp_copy_data(pixel_offset, *width, *height, bits_per_pixel, compression_format);
             break;
         }
         case BMP_HEADER_TYPE_OS2_64: {
             size_t bits_per_pixel = load_bmp_start(&at, end_of_file, width, height);
-            size_t row_size = ((bits_per_pixel * (*width) + 31) / 32) * 4;
-            uint32_t *compression_format = (uint32_t*)consume(&at, end_of_file, sizeof(uint32_t));
+            uint32_t compression_format = *(uint32_t*)consume(&at, end_of_file, sizeof(uint32_t));
+            return im_bmp_copy_data(pixel_offset, *width, *height, bits_per_pixel, compression_format);
             break;
         }
         case BMP_HEADER_TYPE_V4: {
             size_t bits_per_pixel = load_bmp_start(&at, end_of_file, width, height);
-            size_t row_size = ((bits_per_pixel * (*width) + 31) / 32) * 4;
-            uint32_t *compression_format = (uint32_t*)consume(&at, end_of_file, sizeof(uint32_t));
+            uint32_t compression_format = *(uint32_t*)consume(&at, end_of_file, sizeof(uint32_t));
+            return im_bmp_copy_data(pixel_offset, *width, *height, bits_per_pixel, compression_format);
             break;
         }
         case BMP_HEADER_TYPE_V5: {
             size_t bits_per_pixel = load_bmp_start(&at, end_of_file, width, height);
-            size_t row_size = ((bits_per_pixel * (*width) + 31) / 32) * 4;
-            uint32_t *compression_format = (uint32_t*)consume(&at, end_of_file, sizeof(uint32_t));
+            uint32_t compression_format = *(uint32_t*)consume(&at, end_of_file, sizeof(uint32_t));
+            return im_bmp_copy_data(pixel_offset, *width, *height, bits_per_pixel, compression_format);
             break;
         }
     }
