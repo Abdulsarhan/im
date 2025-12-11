@@ -2003,107 +2003,114 @@ typedef struct {
   uint32_t     reserved;
 } bitmap_header_v5;
 
-size_t load_bmp_start(char **at, char *end_of_file, int *width, int *height) {
-    bitmap_header_os2_16 *header;
-    header = (bitmap_header_os2_16*)consume(at, end_of_file, sizeof(bitmap_header_os2_16));
-    *width = header->width;
-    *height = header->height;
-    if(header->num_planes != 1) {
-        IM_ERR("Expected num_planes to be 1, but it's not. We will assume that the rest of the file is not corrupted.");
-    }
+#include <immintrin.h>
 
-    return header->bit_count;
-}
+#include <emmintrin.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 
-
-unsigned char *im_bmp_copy_data(unsigned char *pixel_offset, int width, int height, int bits_per_pixel, uint32_t compression_format) {
+unsigned char *im_bmp_copy_data(unsigned char *pixel_offset, int width, int height, int bits_per_pixel, uint32_t compression_format, const uint8_t *palette) {
     if (width == 0 || height == 0) return NULL;
     int abs_height = (height < 0) ? -height : height;
+    int top_down = (height < 0);
 
-    size_t bytes_per_pixel = bits_per_pixel / 8;
-    size_t data_per_row    = width * bytes_per_pixel;
+    size_t bytes_per_pixel = (bits_per_pixel >= 24) ? ((bits_per_pixel + 7)/8) : 3; /* output RGB(A) */
+    size_t data_per_row = width * bytes_per_pixel;
+    size_t stride;
 
-    /* BMP rows are padded to 4 bytes */
-    size_t stride = ((data_per_row + 3) / 4) * 4;
+    if (bits_per_pixel >= 8)
+        stride = ((width * (bits_per_pixel/8) + 3)/4) * 4;
+    else
+        stride = ((width * bits_per_pixel + 7)/8 + 3)/4*4;
 
-    unsigned char *output_pixels = malloc((size_t)width * abs_height * bytes_per_pixel);
-    if (!output_pixels) return NULL;
+    unsigned char *output = malloc((size_t)width * abs_height * bytes_per_pixel);
+    if (!output) return NULL;
 
-    unsigned char *in  = pixel_offset;
-    unsigned char *out = output_pixels;
+    unsigned char *in = pixel_offset;
 
-    switch (bits_per_pixel) {
-        case 0:
-            break;
-        case 1:
-            break;
-        case 2:
-            break;
-        case 4:
-            break;
-        case 8:
-            break;
-        case 16:
-            break;
-        case 24: /* BGR → RGB */
-        case 32: { /*BGRA -> RGBA */
-            int top_down = (height < 0);
+    for (int row = 0; row < abs_height; row++) {
+        unsigned char *dst_row = output + (size_t)((top_down ? row : (abs_height-1-row)) * width * bytes_per_pixel);
+        unsigned char *dst = dst_row;
+        unsigned char *src = in;
 
-            for (int row = 0; row < abs_height; ++row) {
-                unsigned char *dst_row;
+        if (bits_per_pixel <= 8) {
+            /* palettized images */
+            int x = 0;
+            int pixels_per_byte = 8 / bits_per_pixel;
+            int mask = (1 << bits_per_pixel) - 1;
 
-                if (top_down) {
-                    dst_row = out + row * data_per_row;    /* natural order */
-                } else {
-                    dst_row = out + (abs_height - 1 - row) * data_per_row; /* reversed */
-                }
+            for (; x < width; x++) {
+                int byte_index = x / pixels_per_byte;
+                int shift = (pixels_per_byte - 1 - (x % pixels_per_byte)) * bits_per_pixel;
+                int idx = (src[byte_index] >> shift) & mask;
 
-                unsigned char *src = in;
-                unsigned char *dst = dst_row;
-
-                if (bytes_per_pixel == 3) {
-                    /* --- B G R → R G B --- */
-                    for (int x = 0; x < width; ++x) {
-                        unsigned char b = src[0];
-                        unsigned char g = src[1];
-                        unsigned char r = src[2];
-
-                        dst[0] = r;
-                        dst[1] = g;
-                        dst[2] = b;
-
-                        src += 3;
-                        dst += 3;
-                    }
-                } else if (bytes_per_pixel == 4) {
-                    /* --- B G R X → R G B 255 --- */
-                    for (int x = 0; x < width; ++x) {
-                        unsigned char b = src[0];
-                        unsigned char g = src[1];
-                        unsigned char r = src[2];
-                        /* src[3] is reserved / undefined */
-
-                        dst[0] = r;
-                        dst[1] = g;
-                        dst[2] = b;
-                        dst[3] = 255;   /* opaque alpha */
-
-                        src += 4;
-                        dst += 4;
-                    }
-                }
-
-                in += stride;
+                dst[0] = palette[idx*3 + 0];
+                dst[1] = palette[idx*3 + 1];
+                dst[2] = palette[idx*3 + 2];
+                if (bytes_per_pixel == 4) dst[3] = 255;
+                dst += bytes_per_pixel;
             }
-            break;
+        }
+        else if (bytes_per_pixel == 3) {
+            /* 24-bit BGR → RGB, scalar unrolled 4 pixels */
+            int x = 0;
+            for (; x + 3 < width; x += 4) {
+                dst[0] = src[2]; dst[1] = src[1]; dst[2] = src[0];
+                dst[3] = src[5]; dst[4] = src[4]; dst[5] = src[3];
+                dst[6] = src[8]; dst[7] = src[7]; dst[8] = src[6];
+                dst[9] = src[11]; dst[10] = src[10]; dst[11] = src[9];
+
+                src += 12;
+                dst += 12;
+            }
+            for (; x < width; x++) {
+                dst[0] = src[2]; dst[1] = src[1]; dst[2] = src[0];
+                src += 3;
+                dst += 3;
+            }
+        }
+        else if (bytes_per_pixel == 4) {
+            /* 32-bit BGRA → RGBA, SSE2 */
+            int x = 0;
+            const __m128i alpha_set = _mm_set1_epi32(0xFF000000);
+            for (; x + 3 < width; x += 4) {
+                __m128i v = _mm_loadu_si128((__m128i*)src);
+
+                const __m128i mask_r = _mm_set1_epi32(0x000000FF);
+                const __m128i mask_b = _mm_set1_epi32(0x00FF0000);
+                const __m128i mask_mid = _mm_set1_epi32(0xFF00FF00);
+
+                __m128i r = _mm_and_si128(v, mask_r);
+                __m128i b = _mm_and_si128(v, mask_b);
+                __m128i mid = _mm_and_si128(v, mask_mid);
+
+                r = _mm_slli_epi32(r, 16);
+                b = _mm_srli_epi32(b, 16);
+
+                __m128i outv = _mm_or_si128(mid, _mm_or_si128(r, b));
+                outv = _mm_or_si128(outv, alpha_set);
+
+                _mm_storeu_si128((__m128i*)dst, outv);
+
+                src += 16;
+                dst += 16;
+            }
+            /* leftovers */
+            for (; x < width; x++) {
+                dst[0] = src[2];
+                dst[1] = src[1];
+                dst[2] = src[0];
+                dst[3] = 255;
+                src += 4;
+                dst += 4;
+            }
         }
 
-        default:
-            free(output_pixels);
-            return NULL;
+        in += stride;
     }
 
-    return output_pixels;
+    return output;
 }
 
 unsigned char *im_bmp_load(char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
@@ -2111,91 +2118,171 @@ unsigned char *im_bmp_load(char *image_file, size_t file_size, int *width, int *
     char *end_of_file = image_file + file_size;
 
     bitmap_file_header file_header;
-    file_header.type = *(uint16_t*)consume(&at, end_of_file, (sizeof(uint16_t)));
-    file_header.size = *(uint32_t*)consume(&at, end_of_file, (sizeof(uint32_t)));
-    file_header.reserved1 = *(uint16_t*)consume(&at, end_of_file, sizeof(uint16_t));
-    file_header.reserved2 = *(uint16_t*)consume(&at, end_of_file, sizeof(uint16_t));
+    file_header.type        = *(uint16_t*)consume(&at, end_of_file, sizeof(uint16_t));
+    file_header.size        = *(uint32_t*)consume(&at, end_of_file, sizeof(uint32_t));
+    file_header.reserved1   = *(uint16_t*)consume(&at, end_of_file, sizeof(uint16_t));
+    file_header.reserved2   = *(uint16_t*)consume(&at, end_of_file, sizeof(uint16_t));
     file_header.bitmap_offset = *(uint32_t*)consume(&at, end_of_file, sizeof(uint32_t));
-    unsigned char *pixel_offset = image_file + file_header.bitmap_offset;
 
-    if(file_header.size != (uint32_t)file_size) {
-        IM_ERR("File size mentioned in bitmap header does not match the file size that we got from windows.\nWe will assume that the rest of the file is not corrupted.");
-    }
-    if(file_header.reserved1 != 0) {
-        IM_ERR("Reserved byte expected to be 0, but is not 0. We will assume that the rest of the file is not corrupted.");
-    }
-    if(file_header.reserved2 != 0) {
-        IM_ERR("Reserved byte expected to be 0, but is not 0. We will assume that the rest of the file is not corrupted.");
-    }
-    /* Because this file format got multiple revisions, we will just refer to the header
-       that comes after the BITMAPFILEHEADER as the "dib_header". */
+    unsigned char *pixel_offset = (unsigned char *)image_file + file_header.bitmap_offset;
 
-    if(file_header.bitmap_offset < (uint32_t)sizeof(bitmap_file_header)) {
-        IM_ERR("Offset is an unreasonably small number. Corrupt .bmp. Not going to decode.");
-        return NULL;
-    } else {
-        printf("size of file_header: %zu\n", sizeof(bitmap_file_header));
-        printf("Offset from start of header: %d\n", file_header.bitmap_offset);
-    }
-
-    uint32_t *dib_header_size = (uint32_t*)at; /* this is jank, and unsafe. We should have a peek funciton */
+    uint32_t *dib_header_size = (uint32_t*)at;
+    size_t bits_per_pixel = 0;
+    uint8_t rgb_palette[256*3] = {0};
+    int palette_entries = 0;
 
     switch(*dib_header_size) {
-        /* the reason why we can't use load_bmp_start on the first case
-           is that the width and the height fields in bitmap_header_core
-           are different in size to the width and height fields of
-           the other header types. uint16_t vs uint32_t yes, the later headers are int32_t, but they fit in the same number of bytes.
-       */
+
         case BMP_HEADER_TYPE_CORE: {
-            bitmap_header_core header;
-            header = *(bitmap_header_core*)consume(&at, end_of_file, sizeof(bitmap_header_core));
+            bitmap_header_core header = *(bitmap_header_core*)consume(&at, end_of_file, sizeof(bitmap_header_core));
             *width = header.width;
             *height = header.height;
-            return im_bmp_copy_data(pixel_offset, *width, *height, header.bit_count, 0);
+            bits_per_pixel = header.bit_count;
+
+            if(bits_per_pixel <= 8) {
+                palette_entries = 1 << bits_per_pixel;
+                unsigned char *bmp_palette = (unsigned char*)at;
+                for(int i = 0; i < palette_entries; i++) {
+                    rgb_palette[i*3 + 0] = bmp_palette[i*4 + 2]; // R
+                    rgb_palette[i*3 + 1] = bmp_palette[i*4 + 1]; // G
+                    rgb_palette[i*3 + 2] = bmp_palette[i*4 + 0]; // B
+                }
+            }
+            break;
         }
+
         case BMP_HEADER_TYPE_OS2_16: {
-            size_t bits_per_pixel = load_bmp_start(&at, end_of_file, width, height);
-            return im_bmp_copy_data(pixel_offset, *width, *height, bits_per_pixel, 0);
-        }
-        case BMP_HEADER_TYPE_V1: {
-            size_t bits_per_pixel = load_bmp_start(&at, end_of_file, width, height);
-            uint32_t compression_format = *(uint32_t*)consume(&at, end_of_file, sizeof(uint32_t));
-            return im_bmp_copy_data(pixel_offset, *width, *height, bits_per_pixel, compression_format);
+            bitmap_header_os2_16 header = *(bitmap_header_os2_16*)consume(&at, end_of_file, sizeof(bitmap_header_os2_16));
+            *width = header.width;
+            *height = header.height;
+            bits_per_pixel = header.bit_count;
+
+            if(bits_per_pixel <= 8) {
+                palette_entries = 1 << bits_per_pixel;
+                unsigned char *bmp_palette = (unsigned char*)at;
+                for(int i = 0; i < palette_entries; i++) {
+                    rgb_palette[i*3 + 0] = bmp_palette[i*4 + 2];
+                    rgb_palette[i*3 + 1] = bmp_palette[i*4 + 1];
+                    rgb_palette[i*3 + 2] = bmp_palette[i*4 + 0];
+                }
+            }
             break;
         }
-        case BMP_HEADER_TYPE_V2: {
-            size_t bits_per_pixel = load_bmp_start(&at, end_of_file, width, height);
-            uint32_t compression_format = *(uint32_t*)consume(&at, end_of_file, sizeof(uint32_t));
-            return im_bmp_copy_data(pixel_offset, *width, *height, bits_per_pixel, compression_format);
-            break;
-        }
-        case BMP_HEADER_TYPE_V3: {
-            size_t bits_per_pixel = load_bmp_start(&at, end_of_file, width, height);
-            uint32_t compression_format = *(uint32_t*)consume(&at, end_of_file, sizeof(uint32_t));
-            return im_bmp_copy_data(pixel_offset, *width, *height, bits_per_pixel, compression_format);
-            break;
-        }
+
         case BMP_HEADER_TYPE_OS2_64: {
-            size_t bits_per_pixel = load_bmp_start(&at, end_of_file, width, height);
-            uint32_t compression_format = *(uint32_t*)consume(&at, end_of_file, sizeof(uint32_t));
-            return im_bmp_copy_data(pixel_offset, *width, *height, bits_per_pixel, compression_format);
+            bitmap_header_os2_64 header = *(bitmap_header_os2_64*)consume(&at, end_of_file, sizeof(bitmap_header_os2_64));
+            *width = header.width;
+            *height = header.height;
+            bits_per_pixel = header.bit_count;
+
+            if(bits_per_pixel <= 8) {
+                palette_entries = header.num_color_indices ? header.num_color_indices : 1 << bits_per_pixel;
+                unsigned char *bmp_palette = (unsigned char*)at;
+                for(int i = 0; i < palette_entries; i++) {
+                    rgb_palette[i*3 + 0] = bmp_palette[i*4 + 2];
+                    rgb_palette[i*3 + 1] = bmp_palette[i*4 + 1];
+                    rgb_palette[i*3 + 2] = bmp_palette[i*4 + 0];
+                }
+            }
             break;
         }
+
+        case BMP_HEADER_TYPE_V1: {
+            bitmap_header_v1 header = *(bitmap_header_v1*)consume(&at, end_of_file, sizeof(bitmap_header_v1));
+            *width = header.width;
+            *height = header.height;
+            bits_per_pixel = header.bit_count;
+
+            if(bits_per_pixel <= 8) {
+                palette_entries = header.num_color_indices ? header.num_color_indices : 1 << bits_per_pixel;
+                unsigned char *bmp_palette = (unsigned char*)at;
+                for(int i = 0; i < palette_entries; i++) {
+                    rgb_palette[i*3 + 0] = bmp_palette[i*4 + 2];
+                    rgb_palette[i*3 + 1] = bmp_palette[i*4 + 1];
+                    rgb_palette[i*3 + 2] = bmp_palette[i*4 + 0];
+                }
+            }
+            break;
+        }
+
+        case BMP_HEADER_TYPE_V2: {
+            bitmap_header_v2 header = *(bitmap_header_v2*)consume(&at, end_of_file, sizeof(bitmap_header_v2));
+            *width = header.width;
+            *height = header.height;
+            bits_per_pixel = header.bit_count;
+
+            if(bits_per_pixel <= 8) {
+                palette_entries = header.num_color_indices ? header.num_color_indices : 1 << bits_per_pixel;
+                unsigned char *bmp_palette = (unsigned char*)at;
+                for(int i = 0; i < palette_entries; i++) {
+                    rgb_palette[i*3 + 0] = bmp_palette[i*4 + 2];
+                    rgb_palette[i*3 + 1] = bmp_palette[i*4 + 1];
+                    rgb_palette[i*3 + 2] = bmp_palette[i*4 + 0];
+                }
+            }
+            break;
+        }
+
+        case BMP_HEADER_TYPE_V3: {
+            bitmap_header_v3 header = *(bitmap_header_v3*)consume(&at, end_of_file, sizeof(bitmap_header_v3));
+            *width = header.width;
+            *height = header.height;
+            bits_per_pixel = header.bit_count;
+
+            if(bits_per_pixel <= 8) {
+                palette_entries = header.num_color_indices ? header.num_color_indices : 1 << bits_per_pixel;
+                unsigned char *bmp_palette = (unsigned char*)at;
+                for(int i = 0; i < palette_entries; i++) {
+                    rgb_palette[i*3 + 0] = bmp_palette[i*4 + 2];
+                    rgb_palette[i*3 + 1] = bmp_palette[i*4 + 1];
+                    rgb_palette[i*3 + 2] = bmp_palette[i*4 + 0];
+                }
+            }
+            break;
+        }
+
         case BMP_HEADER_TYPE_V4: {
-            size_t bits_per_pixel = load_bmp_start(&at, end_of_file, width, height);
-            uint32_t compression_format = *(uint32_t*)consume(&at, end_of_file, sizeof(uint32_t));
-            return im_bmp_copy_data(pixel_offset, *width, *height, bits_per_pixel, compression_format);
+            bitmap_header_v4 header = *(bitmap_header_v4*)consume(&at, end_of_file, sizeof(bitmap_header_v4));
+            *width = header.width;
+            *height = header.height;
+            bits_per_pixel = header.bit_count;
+
+            if(bits_per_pixel <= 8) {
+                palette_entries = header.num_color_indices ? header.num_color_indices : 1 << bits_per_pixel;
+                unsigned char *bmp_palette = (unsigned char*)at;
+                for(int i = 0; i < palette_entries; i++) {
+                    rgb_palette[i*3 + 0] = bmp_palette[i*4 + 2];
+                    rgb_palette[i*3 + 1] = bmp_palette[i*4 + 1];
+                    rgb_palette[i*3 + 2] = bmp_palette[i*4 + 0];
+                }
+            }
             break;
         }
+
         case BMP_HEADER_TYPE_V5: {
-            size_t bits_per_pixel = load_bmp_start(&at, end_of_file, width, height);
-            uint32_t compression_format = *(uint32_t*)consume(&at, end_of_file, sizeof(uint32_t));
-            return im_bmp_copy_data(pixel_offset, *width, *height, bits_per_pixel, compression_format);
+            bitmap_header_v5 header = *(bitmap_header_v5*)consume(&at, end_of_file, sizeof(bitmap_header_v5));
+            *width = header.width;
+            *height = header.height;
+            bits_per_pixel = header.bit_count;
+
+            if(bits_per_pixel <= 8) {
+                palette_entries = header.num_color_indices ? header.num_color_indices : 1 << bits_per_pixel;
+                unsigned char *bmp_palette = (unsigned char*)at;
+                for(int i = 0; i < palette_entries; i++) {
+                    rgb_palette[i*3 + 0] = bmp_palette[i*4 + 2];
+                    rgb_palette[i*3 + 1] = bmp_palette[i*4 + 1];
+                    rgb_palette[i*3 + 2] = bmp_palette[i*4 + 0];
+                }
+            }
             break;
         }
+
+        default:
+            IM_ERR("Unsupported BMP header size: %u\n", *dib_header_size);
+            return NULL;
     }
 
-    return NULL;
+    return im_bmp_copy_data(pixel_offset, *width, *height, bits_per_pixel, 0, (bits_per_pixel <= 8) ? rgb_palette : NULL);
 }
 
 IM_API unsigned char *im_load(const char *image_path, int *width, int *height, int *number_of_channels, int desired_channels) {

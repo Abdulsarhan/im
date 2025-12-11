@@ -38,7 +38,7 @@ int main(int argc, char **argv) {
         }
 
         if(pal_is_key_pressed(-1, PAL_SCAN_ESCAPE) || pal_is_key_pressed(-1, PAL_SCAN_CAPSLOCK)) {
-            exit(0);
+            return 0;
         }
 
         size_t img_pixel_idx = 0;
@@ -56,11 +56,10 @@ int main(int argc, char **argv) {
                 pal_draw_rect(window, x + 400, y + 300, 1, 1, color);
 
 #endif
-                // Read source color from PNG
-                pal_vec4 color;
-                color.r = (float)image[img_pixel_idx++] / 255.0f;
-                color.g = (float)image[img_pixel_idx++] / 255.0f;
-                color.b = (float)image[img_pixel_idx++] / 255.0f;
+                pal_color color;
+                color.r = image[img_pixel_idx++];
+                color.g = image[img_pixel_idx++];
+                color.b = image[img_pixel_idx++];
                 color.a =  255.0f;
                 pal_draw_rect(window, x + window_width / 2, y + window_height / 2, 1, 1, color);
 #if 0
