@@ -830,7 +830,7 @@ static void im_png_unfilter(im_png_info *info) {
     }
     
     // Now remove the filter bytes and compact the data
-    char *unfiltered = malloc(info->height * bytes_per_scanline);
+    unsigned char *unfiltered = malloc(info->height * bytes_per_scanline);
     if (!unfiltered) {
         IM_ERR("Failed to allocate memory for unfiltered data");
         return;
@@ -2016,7 +2016,6 @@ unsigned char *im_bmp_copy_data(unsigned char *pixel_offset, int width, int heig
     int top_down = (height < 0);
 
     size_t bytes_per_pixel = (bits_per_pixel >= 24) ? ((bits_per_pixel + 7)/8) : 3; /* output RGB(A) */
-    size_t data_per_row = width * bytes_per_pixel;
     size_t stride;
 
     if (bits_per_pixel >= 8)
