@@ -18,7 +18,6 @@ int main(int argc, char **argv) {
     int image_width, image_height, nr_channels;
 
     unsigned char *image = im_load(file_path, &image_width, &image_height, &nr_channels, 0);
-    exit(0);
     pal_init();
     int window_width = 800, window_height = 600;
     pal_window *window = pal_create_window(window_width, window_height, "image_viewer", PAL_WINDOW_RESIZABLE);

@@ -371,9 +371,8 @@ static void im_unfilter_sub_4bpp_sse2(uint8_t *row, size_t rowbytes) {
     while (i + 16 <= rowbytes) {
         __m128i x = _mm_loadu_si128((__m128i*)(row + i));
         
-        /* Add carry from previous chunk */
-        __m128i carry = _mm_shuffle_epi32(prev, 0xFF);
-        x = _mm_add_epi8(x, _mm_slli_si128(carry, 12));
+        /* Add carry from previous chunk (prev has last pixel in element 0) */
+        x = _mm_add_epi8(x, prev);
         
         /* Prefix sum for 4-byte elements */
         x = _mm_add_epi8(x, _mm_slli_si128(x, 4));
@@ -498,7 +497,7 @@ static void im_unfilter_up_neon(uint8_t *row, const uint8_t *prev, size_t rowbyt
 }
 
 static void im_unfilter_sub_3bpp_neon(uint8_t *row, size_t rowbytes) {
-    unfilter_sub_scalar(row, rowbytes, 3);
+    im_unfilter_sub_scalar(row, rowbytes, 3);
 }
 
 static void im_unfilter_sub_4bpp_neon(uint8_t *row, size_t rowbytes) {
@@ -510,10 +509,13 @@ static void im_unfilter_sub_4bpp_neon(uint8_t *row, size_t rowbytes) {
     while (i + 16 <= rowbytes) {
         uint8x16_t x = vld1q_u8(row + i);
         
-        uint8x16_t carry = vreinterpretq_u8_u32(vdupq_n_u32(prev_pixel));
-        carry = vextq_u8(vdupq_n_u8(0), carry, 12);
+        /* Add carry from previous chunk - prev_pixel goes in bytes 0-3 only */
+        uint32x4_t prev_vec = vdupq_n_u32(0);
+        prev_vec = vsetq_lane_u32(prev_pixel, prev_vec, 0);
+        uint8x16_t carry = vreinterpretq_u8_u32(prev_vec);
         x = vaddq_u8(x, carry);
         
+        /* Prefix sum for 4-byte elements (shift left, then add) */
         x = vaddq_u8(x, vextq_u8(vdupq_n_u8(0), x, 12));
         x = vaddq_u8(x, vextq_u8(vdupq_n_u8(0), x, 8));
         
@@ -604,7 +606,6 @@ static void im_unfilter_paeth_4bpp_neon(uint8_t *row, const uint8_t *prev, size_
  * ============================================================================ */
 
 static void im_unfilter_up(uint8_t *row, const uint8_t *prev, size_t rowbytes) {
-    
 #ifdef IM_X86
     if (im_cpu_has_sse2) {
         im_unfilter_up_sse2(row, prev, rowbytes);
@@ -621,7 +622,6 @@ static void im_unfilter_up(uint8_t *row, const uint8_t *prev, size_t rowbytes) {
 }
 
 static void im_unfilter_sub(uint8_t *row, size_t rowbytes, size_t bpp) {
-    
 #ifdef IM_X86
     if (im_cpu_has_sse2) {
         if (bpp == 4) { im_unfilter_sub_4bpp_sse2(row, rowbytes); return; }
@@ -638,7 +638,6 @@ static void im_unfilter_sub(uint8_t *row, size_t rowbytes, size_t bpp) {
 }
 
 static void im_unfilter_avg(uint8_t *row, const uint8_t *prev, size_t rowbytes, size_t bpp) {
-    
 #ifdef IM_X86
     if (im_cpu_has_sse2 && bpp == 4) {
         im_unfilter_avg_4bpp_sse2(row, prev, rowbytes);
@@ -1483,340 +1482,6 @@ static int huff_decode_dynamic(im_bitstream *bs, im_huffman_table *table) {
     return -1;
 }
 
-/* 
- * Safety margin for fast path: 258 is max match length in deflate.
- * We add extra margin for the two-symbol-at-a-time optimization.
- */
-#define INFLATE_FAST_MARGIN 258
-
-/*
- * FAST PATH for Fixed Huffman (btype 1)
- * No bounds checking - caller guarantees at least INFLATE_FAST_MARGIN bytes available.
- * Returns number of bytes written, or -1 on format error.
- * Sets *done to 1 if end-of-block reached.
- */
-static int64_t im_inflate_fixed_fast(im_bitstream *bs, uint8_t *output, size_t out_pos, int *done) {
-    size_t start_pos = out_pos;
-    *done = 0;
-    
-    while (1) {
-        bs_refill(bs);
-        
-        int sym1, len1;
-        DECODE_FIXED(bs, im_fixed_lit_table, sym1, len1);
-        bs_drop(bs, len1);
-        
-        if (sym1 < 256) {
-            /* First symbol is literal - try to decode second */
-            int sym2, len2;
-            DECODE_FIXED(bs, im_fixed_lit_table, sym2, len2);
-            
-            if (sym2 < 256) {
-                /* Both are literals - write both! (no bounds check needed) */
-                output[out_pos++] = (uint8_t)sym1;
-                output[out_pos++] = (uint8_t)sym2;
-                bs_drop(bs, len2);
-                continue;
-            }
-            
-            /* Second is not a literal - write first, process second */
-            output[out_pos++] = (uint8_t)sym1;
-            bs_drop(bs, len2);
-            sym1 = sym2;
-        } 
-        
-        /* Handle non-literal (length/distance or end) */
-        if (sym1 == 256) {
-            *done = 1;
-            break;
-        }
-        
-        /* Length code 257-285 */
-        int len_idx = sym1 - 257;
-        if (len_idx < 0 || len_idx >= 29) return -1;
-        
-        int length = im_length_base[len_idx];
-        if (im_length_extra[len_idx] > 0) {
-            length += bs_read(bs, im_length_extra[len_idx]);
-        }
-        
-        /* Decode distance */
-        bs_refill(bs);
-        int dist_sym, dist_len;
-        DECODE_FIXED(bs, im_fixed_dist_table, dist_sym, dist_len);
-        bs_drop(bs, dist_len);
-        
-        if (dist_sym >= 30) return -1;
-        
-        int distance = im_distance_base[dist_sym];
-        if (im_distance_extra[dist_sym] > 0) {
-            distance += bs_read(bs, im_distance_extra[dist_sym]);
-        }
-        
-        if ((size_t)distance > out_pos) return -1;
-        
-        /* Copy from back-reference (no output bounds check needed) */
-        uint8_t *src = output + out_pos - distance;
-        uint8_t *dst = output + out_pos;
-        out_pos += length;
-        
-        /* Fast copy - unroll small copies for common cases */
-        if (distance == 1) {
-            /* RLE: replicate single byte */
-            memset(dst, *src, length);
-        } else if (distance >= length) {
-            /* Non-overlapping: can use memcpy */
-            memcpy(dst, src, length);
-        } else {
-            /* Overlapping: byte-by-byte */
-            for (int j = 0; j < length; j++) {
-                *dst++ = *src++;
-            }
-        }
-        
-        /* Return to caller to check if we should switch to slow path */
-        break;
-    }
-    
-    return (int64_t)(out_pos - start_pos);
-}
-
-/*
- * SLOW PATH for Fixed Huffman (btype 1)
- * Full bounds checking on every write.
- * Returns number of bytes written, or -1 on error.
- * Sets *done to 1 if end-of-block reached.
- */
-static int64_t im_inflate_fixed_slow(im_bitstream *bs, uint8_t *output, size_t out_pos, 
-                                      size_t output_size, int *done) {
-    size_t start_pos = out_pos;
-    *done = 0;
-    
-    while (1) {
-        bs_refill(bs);
-        
-        int sym1, len1;
-        DECODE_FIXED(bs, im_fixed_lit_table, sym1, len1);
-        bs_drop(bs, len1);
-        
-        if (sym1 < 256) {
-            /* First symbol is literal - try to decode second */
-            int sym2, len2;
-            DECODE_FIXED(bs, im_fixed_lit_table, sym2, len2);
-            
-            if (sym2 < 256) {
-                /* Both are literals */
-                if (out_pos + 2 > output_size) return -1;
-                output[out_pos++] = (uint8_t)sym1;
-                output[out_pos++] = (uint8_t)sym2;
-                bs_drop(bs, len2);
-                continue;
-            }
-            
-            if (out_pos >= output_size) return -1;
-            output[out_pos++] = (uint8_t)sym1;
-            bs_drop(bs, len2);
-            sym1 = sym2;
-        } 
-        
-        if (sym1 == 256) {
-            *done = 1;
-            break;
-        }
-        
-        int len_idx = sym1 - 257;
-        if (len_idx < 0 || len_idx >= 29) return -1;
-        
-        int length = im_length_base[len_idx];
-        if (im_length_extra[len_idx] > 0) {
-            length += bs_read(bs, im_length_extra[len_idx]);
-        }
-        
-        bs_refill(bs);
-        int dist_sym, dist_len;
-        DECODE_FIXED(bs, im_fixed_dist_table, dist_sym, dist_len);
-        bs_drop(bs, dist_len);
-        
-        if (dist_sym >= 30) return -1;
-        
-        int distance = im_distance_base[dist_sym];
-        if (im_distance_extra[dist_sym] > 0) {
-            distance += bs_read(bs, im_distance_extra[dist_sym]);
-        }
-        
-        if ((size_t)distance > out_pos) return -1;
-        if (out_pos + length > output_size) return -1;
-        
-        uint8_t *src = output + out_pos - distance;
-        uint8_t *dst = output + out_pos;
-        
-        if (distance == 1) {
-            memset(dst, *src, length);
-        } else if (distance >= length) {
-            memcpy(dst, src, length);
-        } else {
-            for (int j = 0; j < length; j++) {
-                *dst++ = *src++;
-            }
-        }
-        out_pos += length;
-    }
-    
-    return (int64_t)(out_pos - start_pos);
-}
-
-/*
- * FAST PATH for Dynamic Huffman (btype 2)
- * No bounds checking - caller guarantees at least INFLATE_FAST_MARGIN bytes available.
- */
-static int64_t im_inflate_dynamic_fast(im_bitstream *bs, im_huffman_table *lit_table,
-                                        im_huffman_table *dist_table, uint8_t *output,
-                                        size_t out_pos, int *done) {
-    size_t start_pos = out_pos;
-    *done = 0;
-    
-    while (1) {
-        bs_refill(bs);
-        
-        int sym1 = huff_decode_dynamic(bs, lit_table);
-        if (sym1 < 0) return -1;
-        
-        if (sym1 < 256) {
-            /* First is literal - try second */
-            int sym2 = huff_decode_dynamic(bs, lit_table);
-            if (sym2 < 0) return -1;
-            
-            if (sym2 < 256) {
-                /* Both literals (no bounds check needed) */
-                output[out_pos++] = (uint8_t)sym1;
-                output[out_pos++] = (uint8_t)sym2;
-                continue;
-            }
-            
-            output[out_pos++] = (uint8_t)sym1;
-            sym1 = sym2;
-        }
-        
-        if (sym1 == 256) {
-            *done = 1;
-            break;
-        }
-        
-        int len_idx = sym1 - 257;
-        if (len_idx < 0 || len_idx >= 29) return -1;
-        
-        int length = im_length_base[len_idx];
-        if (im_length_extra[len_idx] > 0) {
-            length += bs_read(bs, im_length_extra[len_idx]);
-        }
-        
-        bs_refill(bs);
-        int dist_sym = huff_decode_dynamic(bs, dist_table);
-        if (dist_sym < 0 || dist_sym >= 30) return -1;
-        
-        int distance = im_distance_base[dist_sym];
-        if (im_distance_extra[dist_sym] > 0) {
-            distance += bs_read(bs, im_distance_extra[dist_sym]);
-        }
-        
-        if ((size_t)distance > out_pos) return -1;
-        
-        uint8_t *src = output + out_pos - distance;
-        uint8_t *dst = output + out_pos;
-        out_pos += length;
-        
-        if (distance == 1) {
-            memset(dst, *src, length);
-        } else if (distance >= length) {
-            memcpy(dst, src, length);
-        } else {
-            for (int j = 0; j < length; j++) {
-                *dst++ = *src++;
-            }
-        }
-        
-        /* Return to caller to check if we should switch to slow path */
-        break;
-    }
-    
-    return (int64_t)(out_pos - start_pos);
-}
-
-/*
- * SLOW PATH for Dynamic Huffman (btype 2)
- * Full bounds checking on every write.
- */
-static int64_t im_inflate_dynamic_slow(im_bitstream *bs, im_huffman_table *lit_table,
-                                        im_huffman_table *dist_table, uint8_t *output,
-                                        size_t out_pos, size_t output_size, int *done) {
-    size_t start_pos = out_pos;
-    *done = 0;
-    
-    while (1) {
-        bs_refill(bs);
-        
-        int sym1 = huff_decode_dynamic(bs, lit_table);
-        if (sym1 < 0) return -1;
-        
-        if (sym1 < 256) {
-            int sym2 = huff_decode_dynamic(bs, lit_table);
-            if (sym2 < 0) return -1;
-            
-            if (sym2 < 256) {
-                if (out_pos + 2 > output_size) return -1;
-                output[out_pos++] = (uint8_t)sym1;
-                output[out_pos++] = (uint8_t)sym2;
-                continue;
-            }
-            
-            if (out_pos >= output_size) return -1;
-            output[out_pos++] = (uint8_t)sym1;
-            sym1 = sym2;
-        }
-        
-        if (sym1 == 256) {
-            *done = 1;
-            break;
-        }
-        
-        int len_idx = sym1 - 257;
-        if (len_idx < 0 || len_idx >= 29) return -1;
-        
-        int length = im_length_base[len_idx];
-        if (im_length_extra[len_idx] > 0) {
-            length += bs_read(bs, im_length_extra[len_idx]);
-        }
-        
-        bs_refill(bs);
-        int dist_sym = huff_decode_dynamic(bs, dist_table);
-        if (dist_sym < 0 || dist_sym >= 30) return -1;
-        
-        int distance = im_distance_base[dist_sym];
-        if (im_distance_extra[dist_sym] > 0) {
-            distance += bs_read(bs, im_distance_extra[dist_sym]);
-        }
-        
-        if ((size_t)distance > out_pos) return -1;
-        if (out_pos + length > output_size) return -1;
-        
-        uint8_t *src = output + out_pos - distance;
-        uint8_t *dst = output + out_pos;
-        
-        if (distance == 1) {
-            memset(dst, *src, length);
-        } else if (distance >= length) {
-            memcpy(dst, src, length);
-        } else {
-            for (int j = 0; j < length; j++) {
-                *dst++ = *src++;
-            }
-        }
-        out_pos += length;
-    }
-    
-    return (int64_t)(out_pos - start_pos);
-}
-
 static int64_t im_inflate(const uint8_t *compressed, size_t comp_size, uint8_t *output, size_t output_size) {
     im_bitstream bs;
     bs_init(&bs, compressed, comp_size);
@@ -1836,32 +1501,83 @@ static int64_t im_inflate(const uint8_t *compressed, size_t comp_size, uint8_t *
             
             if ((len ^ nlen) != 0xFFFF) return -1;
             
-            if (out_pos + len > output_size) return -1;
             for (uint16_t i = 0; i < len; i++) {
+                if (out_pos >= output_size) return -1;
                 output[out_pos++] = bs_read(&bs, 8);
             }
             
         } else if (btype == 1) {
             /*
-             * Fixed Huffman - use fast path when far from end,
-             * slow path when close to end.
+             * Fixed Huffman with TWO-SYMBOL-AT-A-TIME optimization
              */
-            int done = 0;
-            while (!done) {
-                int64_t written;
-                if (out_pos + INFLATE_FAST_MARGIN <= output_size) {
-                    /* FAST PATH: plenty of room, skip bounds checks */
-                    written = im_inflate_fixed_fast(&bs, output, out_pos, &done);
-                } else {
-                    /* SLOW PATH: near end, check every write */
-                    written = im_inflate_fixed_slow(&bs, output, out_pos, output_size, &done);
+            while (1) {
+                bs_refill(&bs);
+                
+                int sym1, len1;
+                DECODE_FIXED(&bs, im_fixed_lit_table, sym1, len1);
+                bs_drop(&bs, len1);
+                
+                if (sym1 < 256) {
+                    /* First symbol is literal - try to decode second */
+                    int sym2, len2;
+                    DECODE_FIXED(&bs, im_fixed_lit_table, sym2, len2);
+                    
+                    if (sym2 < 256) {
+                        /* Both are literals - write both! */
+                        if (out_pos + 2 > output_size) return -1;
+                        output[out_pos++] = (uint8_t)sym1;
+                        output[out_pos++] = (uint8_t)sym2;
+                        bs_drop(&bs, len2);
+                        continue;
+                    }
+                    
+                    /* Second is not a literal - write first, process second */
+                    if (out_pos >= output_size) return -1;
+                    output[out_pos++] = (uint8_t)sym1;
+                    bs_drop(&bs, len2);
+                    sym1 = sym2;
+                } 
+                
+                if (sym1 == 256) {
+                    break;  /* End of block */
                 }
-                if (written < 0) return -1;
-                out_pos += written;
+                
+                /* Length code 257-285 */
+                int len_idx = sym1 - 257;
+                if (len_idx < 0 || len_idx >= 29) return -1;
+                
+                int length = im_length_base[len_idx];
+                if (im_length_extra[len_idx] > 0) {
+                    length += bs_read(&bs, im_length_extra[len_idx]);
+                }
+                
+                /* Decode distance */
+                bs_refill(&bs);
+                int dist_sym, dist_len;
+                DECODE_FIXED(&bs, im_fixed_dist_table, dist_sym, dist_len);
+                bs_drop(&bs, dist_len);
+                
+                if (dist_sym >= 30) return -1;
+                
+                int distance = im_distance_base[dist_sym];
+                if (im_distance_extra[dist_sym] > 0) {
+                    distance += bs_read(&bs, im_distance_extra[dist_sym]);
+                }
+                
+                if ((size_t)distance > out_pos) return -1;
+                if (out_pos + length > output_size) return -1;
+                
+                /* Copy from back-reference */
+                uint8_t *src = output + out_pos - distance;
+                uint8_t *dst = output + out_pos;
+                for (int j = 0; j < length; j++) {
+                    *dst++ = *src++;
+                }
+                out_pos += length;
             }
             
         } else if (btype == 2) {
-            /* Dynamic Huffman - parse code length tables first */
+            /* Dynamic Huffman - also with two-symbol optimization */
             int hlit = bs_read(&bs, 5) + 257;
             int hdist = bs_read(&bs, 5) + 1;
             int hclen = bs_read(&bs, 4) + 4;
@@ -1907,21 +1623,60 @@ static int64_t im_inflate(const uint8_t *compressed, size_t comp_size, uint8_t *
             im_build_huffman_table(&dyn_lit, lengths, hlit);
             im_build_huffman_table(&dyn_dist, lengths + hlit, hdist);
             
-            /* Main decode loop with fast/slow path switching */
-            int done = 0;
-            while (!done) {
-                int64_t written;
-                if (out_pos + INFLATE_FAST_MARGIN <= output_size) {
-                    /* FAST PATH: plenty of room */
-                    written = im_inflate_dynamic_fast(&bs, &dyn_lit, &dyn_dist,
-                                                       output, out_pos, &done);
-                } else {
-                    /* SLOW PATH: near end */
-                    written = im_inflate_dynamic_slow(&bs, &dyn_lit, &dyn_dist,
-                                                       output, out_pos, output_size, &done);
+            /* Main decode loop with two-symbol optimization */
+            while (1) {
+                bs_refill(&bs);
+                
+                int sym1 = huff_decode_dynamic(&bs, &dyn_lit);
+                if (sym1 < 0) return -1;
+                
+                if (sym1 < 256) {
+                    /* First is literal - try second */
+                    int sym2 = huff_decode_dynamic(&bs, &dyn_lit);
+                    if (sym2 < 0) return -1;
+                    
+                    if (sym2 < 256) {
+                        /* Both literals */
+                        if (out_pos + 2 > output_size) return -1;
+                        output[out_pos++] = (uint8_t)sym1;
+                        output[out_pos++] = (uint8_t)sym2;
+                        continue;
+                    }
+                    
+                    /* Write first, handle second */
+                    if (out_pos >= output_size) return -1;
+                    output[out_pos++] = (uint8_t)sym1;
+                    sym1 = sym2;
                 }
-                if (written < 0) return -1;
-                out_pos += written;
+                
+                if (sym1 == 256) break;
+                
+                int len_idx = sym1 - 257;
+                if (len_idx < 0 || len_idx >= 29) return -1;
+                
+                int length = im_length_base[len_idx];
+                if (im_length_extra[len_idx] > 0) {
+                    length += bs_read(&bs, im_length_extra[len_idx]);
+                }
+                
+                bs_refill(&bs);
+                int dist_sym = huff_decode_dynamic(&bs, &dyn_dist);
+                if (dist_sym < 0 || dist_sym >= 30) return -1;
+                
+                int distance = im_distance_base[dist_sym];
+                if (im_distance_extra[dist_sym] > 0) {
+                    distance += bs_read(&bs, im_distance_extra[dist_sym]);
+                }
+                
+                if ((size_t)distance > out_pos) return -1;
+                if (out_pos + length > output_size) return -1;
+                
+                uint8_t *src = output + out_pos - distance;
+                uint8_t *dst = output + out_pos;
+                for (int j = 0; j < length; j++) {
+                    *dst++ = *src++;
+                }
+                out_pos += length;
             }
             
         } else {
