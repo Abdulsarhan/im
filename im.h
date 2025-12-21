@@ -29,7 +29,36 @@ IM_API unsigned char *im_load(const char *image_path, int *width, int *height, i
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
-#include <assert.h> // for testing only, should be removed in prod.
+
+#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)
+    #define IM_X86 1
+    #include <emmintrin.h>
+    #if defined(_MSC_VER)
+        #include <intrin.h>
+    #elif defined(__GNUC__) || defined(__clang__)
+        #include <cpuid.h>
+    #endif
+#endif
+
+#if defined(__arm__) || defined(__aarch64__) || defined(_M_ARM) || defined(_M_ARM64)
+    #define IM_ARM 1
+    #if defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(__aarch64__) || defined(_M_ARM64)
+        #define IM_CAN_COMPILE_NEON 1
+        #include <arm_neon.h>
+    #endif
+    #if defined(__linux__)
+        #include <sys/auxv.h>
+        #if defined(__aarch64__)
+            #include <asm/hwcap.h>
+        #else
+            #ifndef HWCAP_NEON
+                #define HWCAP_NEON (1 << 12)
+            #endif
+        #endif
+    #elif defined(_WIN32)
+        #include <windows.h>
+    #endif
+#endif
 
 #ifndef _STDINT_H
 /* 8-bit type */
@@ -76,7 +105,6 @@ typedef signed   long long int64_t;
 
 #endif
 
-
 /* The IM_ERR macro does not work if you try to split up the macro across multiple lines */
 #ifndef IM_NO_ERRORS
 #define IM_ERROR(...) \
@@ -91,7 +119,7 @@ typedef signed   long long int64_t;
 #define IM_ERR(...)((void)0)
 #endif
 
-#ifndef IM_NO_INFO
+#ifdef IM_DEBUG
 #define IM_INFORMATION(...) \
     do { \
         printf("[INFO] "); \
@@ -167,9 +195,9 @@ typedef enum {
 }im_png_chunk_types_le;
 
 typedef struct{
-    char *png_file;
-    char *at; // newer variable used for parsing
-    char *end_of_file; // we use at + end of file to figure out where we are, and where the end is so that we don't go over.
+    unsigned char *png_file;
+    unsigned char *at; // newer variable used for parsing
+    unsigned char *end_of_file; // we use at + end of file to figure out where we are, and where the end is so that we don't go over.
     uint32_t width;
     uint32_t height;
     uint8_t channel_count; /* channels are called "samples" in the spec, but that's stupid, so I won't call them samples. */
@@ -212,6 +240,436 @@ typedef struct{
 
 uint8_t im_png_sig[PNG_SIG_LEN] = {137, 80, 78, 71, 13, 10, 26, 10};
 
+static int im_cpu_has_sse2 = -1;  /* -1 = not checked, 0 = no, 1 = yes */
+static int im_cpu_has_neon = -1;
+
+static void im_detect_cpu_features(void) {
+    /* SSE2 detection for x86/x64 */
+#ifdef IM_X86
+    #if defined(_MSC_VER)
+        int info[4];
+        __cpuid(info, 1);
+        im_cpu_has_sse2 = (info[3] & (1 << 26)) != 0;
+    #elif defined(__GNUC__) || defined(__clang__)
+        unsigned int eax, ebx, ecx, edx;
+        if (__get_cpuid(1, &eax, &ebx, &ecx, &edx)) {
+            im_cpu_has_sse2 = (edx & (1 << 26)) != 0;
+        } else {
+            im_cpu_has_sse2 = 0;
+        }
+    #else
+        im_cpu_has_sse2 = 0;
+    #endif
+#else
+    im_cpu_has_sse2 = 0;
+#endif
+
+    /* NEON detection for ARM */
+#ifdef IM_ARM
+    #if defined(__aarch64__) || defined(_M_ARM64)
+        /* NEON is mandatory on AArch64 */
+        im_cpu_has_neon = 1;
+    #elif defined(__linux__)
+        unsigned long hwcap = getauxval(AT_HWCAP);
+        im_cpu_has_neon = (hwcap & HWCAP_NEON) != 0;
+    #elif defined(__APPLE__)
+        /* NEON always available on Apple ARM chips */
+        im_cpu_has_neon = 1;
+    #elif defined(_WIN32)
+        im_cpu_has_neon = IsProcessorFeaturePresent(PF_ARM_NEON_INSTRUCTIONS_AVAILABLE);
+    #else
+        im_cpu_has_neon = 0;
+    #endif
+#else
+    im_cpu_has_neon = 0;
+#endif
+}
+
+static uint8_t im_paeth_predictor(uint8_t a, uint8_t b, uint8_t c) {
+    int p = (int)a + (int)b - (int)c;
+    int pa = p > a ? p - a : a - p;
+    int pb = p > b ? p - b : b - p;
+    int pc = p > c ? p - c : c - p;
+    if (pa <= pb && pa <= pc) return a;
+    if (pb <= pc) return b;
+    return c;
+}
+
+static void im_unfilter_sub_scalar(uint8_t *row, size_t rowbytes, size_t bpp) {
+    for (size_t i = bpp; i < rowbytes; i++) {
+        row[i] += row[i - bpp];
+    }
+}
+
+static void im_unfilter_up_scalar(uint8_t *row, const uint8_t *prev, size_t rowbytes) {
+    for (size_t i = 0; i < rowbytes; i++) {
+        row[i] += prev[i];
+    }
+}
+
+static void im_unfilter_avg_scalar(uint8_t *row, const uint8_t *prev, size_t rowbytes, size_t bpp) {
+    size_t i = 0;
+    for (; i < bpp; i++) {
+        row[i] += prev[i] >> 1;
+    }
+    for (; i < rowbytes; i++) {
+        row[i] += (row[i - bpp] + prev[i]) >> 1;
+    }
+}
+
+static void im_unfilter_paeth_scalar(uint8_t *row, const uint8_t *prev, size_t rowbytes, size_t bpp) {
+    size_t i = 0;
+    for (; i < bpp; i++) {
+        row[i] += prev[i];
+    }
+    for (; i < rowbytes; i++) {
+        row[i] += im_paeth_predictor(row[i - bpp], prev[i], prev[i - bpp]);
+    }
+}
+
+/* ============================================================================
+ * SSE2 IMPLEMENTATIONS
+ * ============================================================================ */
+
+#ifdef IM_X86
+
+static void im_unfilter_up_sse2(uint8_t *row, const uint8_t *prev, size_t rowbytes) {
+    size_t i = 0;
+    for (; i + 16 <= rowbytes; i += 16) {
+        __m128i r = _mm_loadu_si128((__m128i*)(row + i));
+        __m128i p = _mm_loadu_si128((__m128i*)(prev + i));
+        _mm_storeu_si128((__m128i*)(row + i), _mm_add_epi8(r, p));
+    }
+    for (; i < rowbytes; i++) {
+        row[i] += prev[i];
+    }
+}
+
+static void im_unfilter_sub_3bpp_sse2(uint8_t *row, size_t rowbytes) {
+    if (rowbytes < 3) return;
+    size_t i = 3;
+    
+    /* Unroll 4 pixels at a time */
+    while (i + 12 <= rowbytes) {
+        row[i+0] += row[i-3]; row[i+1] += row[i-2]; row[i+2] += row[i-1];
+        row[i+3] += row[i+0]; row[i+4] += row[i+1]; row[i+5] += row[i+2];
+        row[i+6] += row[i+3]; row[i+7] += row[i+4]; row[i+8] += row[i+5];
+        row[i+9] += row[i+6]; row[i+10]+= row[i+7]; row[i+11]+= row[i+8];
+        i += 12;
+    }
+    for (; i < rowbytes; i++) {
+        row[i] += row[i - 3];
+    }
+}
+
+static void im_unfilter_sub_4bpp_sse2(uint8_t *row, size_t rowbytes) {
+    if (rowbytes < 4) return;
+    
+    size_t i = 4;
+    __m128i prev = _mm_cvtsi32_si128(*(int*)row);
+    
+    while (i + 16 <= rowbytes) {
+        __m128i x = _mm_loadu_si128((__m128i*)(row + i));
+        
+        /* Add carry from previous chunk */
+        __m128i carry = _mm_shuffle_epi32(prev, 0xFF);
+        x = _mm_add_epi8(x, _mm_slli_si128(carry, 12));
+        
+        /* Prefix sum for 4-byte elements */
+        x = _mm_add_epi8(x, _mm_slli_si128(x, 4));
+        x = _mm_add_epi8(x, _mm_slli_si128(x, 8));
+        
+        _mm_storeu_si128((__m128i*)(row + i), x);
+        prev = _mm_srli_si128(x, 12);
+        i += 16;
+    }
+    
+    for (; i < rowbytes; i++) {
+        row[i] += row[i - 4];
+    }
+}
+
+static void im_unfilter_avg_4bpp_sse2(uint8_t *row, const uint8_t *prev, size_t rowbytes) {
+    if (rowbytes < 4) return;
+    
+    row[0] += prev[0] >> 1;
+    row[1] += prev[1] >> 1;
+    row[2] += prev[2] >> 1;
+    row[3] += prev[3] >> 1;
+    
+    size_t i = 4;
+    
+    while (i + 4 <= rowbytes) {
+        __m128i left = _mm_cvtsi32_si128(*(int*)(row + i - 4));
+        __m128i up = _mm_cvtsi32_si128(*(int*)(prev + i));
+        __m128i cur = _mm_cvtsi32_si128(*(int*)(row + i));
+        
+        /* (a+b)>>1 = ((a^b)>>1) + (a&b) */
+        __m128i xored = _mm_xor_si128(left, up);
+        __m128i anded = _mm_and_si128(left, up);
+        __m128i avg = _mm_add_epi8(
+            _mm_srli_epi16(_mm_and_si128(xored, _mm_set1_epi8((char)0xFE)), 1),
+            anded);
+        
+        cur = _mm_add_epi8(cur, avg);
+        *(int*)(row + i) = _mm_cvtsi128_si32(cur);
+        i += 4;
+    }
+    
+    for (; i < rowbytes; i++) {
+        row[i] += (row[i - 4] + prev[i]) >> 1;
+    }
+}
+
+static void im_unfilter_paeth_4bpp_sse2(uint8_t *row, const uint8_t *prev, size_t rowbytes) {
+    if (rowbytes < 4) return;
+    
+    row[0] += prev[0];
+    row[1] += prev[1];
+    row[2] += prev[2];
+    row[3] += prev[3];
+    
+    size_t i = 4;
+    
+    while (i + 4 <= rowbytes) {
+        __m128i a = _mm_cvtsi32_si128(*(int*)(row + i - 4));
+        __m128i b = _mm_cvtsi32_si128(*(int*)(prev + i));
+        __m128i c = _mm_cvtsi32_si128(*(int*)(prev + i - 4));
+        __m128i cur = _mm_cvtsi32_si128(*(int*)(row + i));
+        
+        __m128i zero = _mm_setzero_si128();
+        __m128i a16 = _mm_unpacklo_epi8(a, zero);
+        __m128i b16 = _mm_unpacklo_epi8(b, zero);
+        __m128i c16 = _mm_unpacklo_epi8(c, zero);
+        
+        __m128i p = _mm_sub_epi16(_mm_add_epi16(a16, b16), c16);
+        
+        __m128i pa = _mm_sub_epi16(p, a16);
+        __m128i pb = _mm_sub_epi16(p, b16);
+        __m128i pc = _mm_sub_epi16(p, c16);
+        
+        pa = _mm_max_epi16(pa, _mm_sub_epi16(zero, pa));
+        pb = _mm_max_epi16(pb, _mm_sub_epi16(zero, pb));
+        pc = _mm_max_epi16(pc, _mm_sub_epi16(zero, pc));
+        
+        __m128i pa_le_pb = _mm_or_si128(_mm_cmplt_epi16(pa, pb), _mm_cmpeq_epi16(pa, pb));
+        __m128i pa_le_pc = _mm_or_si128(_mm_cmplt_epi16(pa, pc), _mm_cmpeq_epi16(pa, pc));
+        __m128i pb_le_pc = _mm_or_si128(_mm_cmplt_epi16(pb, pc), _mm_cmpeq_epi16(pb, pc));
+        
+        __m128i sel_a = _mm_and_si128(pa_le_pb, pa_le_pc);
+        __m128i not_sel_a = _mm_andnot_si128(sel_a, _mm_set1_epi16(-1));
+        
+        __m128i result = _mm_or_si128(
+            _mm_and_si128(sel_a, a16),
+            _mm_and_si128(not_sel_a,
+                _mm_or_si128(
+                    _mm_and_si128(pb_le_pc, b16),
+                    _mm_andnot_si128(pb_le_pc, c16))));
+        
+        __m128i paeth8 = _mm_packus_epi16(result, result);
+        cur = _mm_add_epi8(cur, paeth8);
+        *(int*)(row + i) = _mm_cvtsi128_si32(cur);
+        i += 4;
+    }
+    
+    for (; i < rowbytes; i++) {
+        row[i] += im_paeth_predictor(row[i - 4], prev[i], prev[i - 4]);
+    }
+}
+
+#endif /* IM_X86 */
+
+/* ============================================================================
+ * NEON IMPLEMENTATIONS
+ * ============================================================================ */
+
+#ifdef IM_CAN_COMPILE_NEON
+
+static void im_unfilter_up_neon(uint8_t *row, const uint8_t *prev, size_t rowbytes) {
+    size_t i = 0;
+    for (; i + 16 <= rowbytes; i += 16) {
+        uint8x16_t r = vld1q_u8(row + i);
+        uint8x16_t p = vld1q_u8(prev + i);
+        vst1q_u8(row + i, vaddq_u8(r, p));
+    }
+    for (; i < rowbytes; i++) {
+        row[i] += prev[i];
+    }
+}
+
+static void im_unfilter_sub_3bpp_neon(uint8_t *row, size_t rowbytes) {
+    unfilter_sub_scalar(row, rowbytes, 3);
+}
+
+static void im_unfilter_sub_4bpp_neon(uint8_t *row, size_t rowbytes) {
+    if (rowbytes < 4) return;
+    
+    size_t i = 4;
+    uint32_t prev_pixel = *(uint32_t*)row;
+    
+    while (i + 16 <= rowbytes) {
+        uint8x16_t x = vld1q_u8(row + i);
+        
+        uint8x16_t carry = vreinterpretq_u8_u32(vdupq_n_u32(prev_pixel));
+        carry = vextq_u8(vdupq_n_u8(0), carry, 12);
+        x = vaddq_u8(x, carry);
+        
+        x = vaddq_u8(x, vextq_u8(vdupq_n_u8(0), x, 12));
+        x = vaddq_u8(x, vextq_u8(vdupq_n_u8(0), x, 8));
+        
+        vst1q_u8(row + i, x);
+        prev_pixel = vgetq_lane_u32(vreinterpretq_u32_u8(x), 3);
+        i += 16;
+    }
+    
+    for (; i < rowbytes; i++) {
+        row[i] += row[i - 4];
+    }
+}
+
+static void im_unfilter_avg_4bpp_neon(uint8_t *row, const uint8_t *prev, size_t rowbytes) {
+    if (rowbytes < 4) return;
+    
+    row[0] += prev[0] >> 1;
+    row[1] += prev[1] >> 1;
+    row[2] += prev[2] >> 1;
+    row[3] += prev[3] >> 1;
+    
+    size_t i = 4;
+    
+    while (i + 4 <= rowbytes) {
+        uint8x8_t left = vreinterpret_u8_u32(vld1_dup_u32((uint32_t*)(row + i - 4)));
+        uint8x8_t up = vreinterpret_u8_u32(vld1_dup_u32((uint32_t*)(prev + i)));
+        uint8x8_t cur = vreinterpret_u8_u32(vld1_dup_u32((uint32_t*)(row + i)));
+        
+        uint8x8_t avg = vhadd_u8(left, up);
+        cur = vadd_u8(cur, avg);
+        
+        vst1_lane_u32((uint32_t*)(row + i), vreinterpret_u32_u8(cur), 0);
+        i += 4;
+    }
+    
+    for (; i < rowbytes; i++) {
+        row[i] += (row[i - 4] + prev[i]) >> 1;
+    }
+}
+
+static void im_unfilter_paeth_4bpp_neon(uint8_t *row, const uint8_t *prev, size_t rowbytes) {
+    if (rowbytes < 4) return;
+    
+    row[0] += prev[0];
+    row[1] += prev[1];
+    row[2] += prev[2];
+    row[3] += prev[3];
+    
+    size_t i = 4;
+    
+    while (i + 4 <= rowbytes) {
+        uint8x8_t a8 = vreinterpret_u8_u32(vld1_dup_u32((uint32_t*)(row + i - 4)));
+        uint8x8_t b8 = vreinterpret_u8_u32(vld1_dup_u32((uint32_t*)(prev + i)));
+        uint8x8_t c8 = vreinterpret_u8_u32(vld1_dup_u32((uint32_t*)(prev + i - 4)));
+        uint8x8_t cur = vreinterpret_u8_u32(vld1_dup_u32((uint32_t*)(row + i)));
+        
+        int16x8_t a = vreinterpretq_s16_u16(vmovl_u8(a8));
+        int16x8_t b = vreinterpretq_s16_u16(vmovl_u8(b8));
+        int16x8_t c = vreinterpretq_s16_u16(vmovl_u8(c8));
+        
+        int16x8_t p = vsubq_s16(vaddq_s16(a, b), c);
+        
+        int16x8_t pa = vabsq_s16(vsubq_s16(p, a));
+        int16x8_t pb = vabsq_s16(vsubq_s16(p, b));
+        int16x8_t pc = vabsq_s16(vsubq_s16(p, c));
+        
+        uint16x8_t sel_a = vandq_u16(vcleq_s16(pa, pb), vcleq_s16(pa, pc));
+        uint16x8_t sel_b = vcleq_s16(pb, pc);
+        
+        int16x8_t result = vbslq_s16(sel_a, a, vbslq_s16(sel_b, b, c));
+        
+        uint8x8_t paeth8 = vmovn_u16(vreinterpretq_u16_s16(result));
+        cur = vadd_u8(cur, paeth8);
+        
+        vst1_lane_u32((uint32_t*)(row + i), vreinterpret_u32_u8(cur), 0);
+        i += 4;
+    }
+    
+    for (; i < rowbytes; i++) {
+        row[i] += im_paeth_predictor(row[i - 4], prev[i], prev[i - 4]);
+    }
+}
+
+#endif /* IM_CAN_COMPILE_NEON */
+
+/* ============================================================================
+ * RUNTIME DISPATCHERS
+ * ============================================================================ */
+
+static void im_unfilter_up(uint8_t *row, const uint8_t *prev, size_t rowbytes) {
+    
+#ifdef IM_X86
+    if (im_cpu_has_sse2) {
+        im_unfilter_up_sse2(row, prev, rowbytes);
+        return;
+    }
+#endif
+#ifdef IM_CAN_COMPILE_NEON
+    if (im_cpu_has_neon) {
+        im_unfilter_up_neon(row, prev, rowbytes);
+        return;
+    }
+#endif
+    im_unfilter_up_scalar(row, prev, rowbytes);
+}
+
+static void im_unfilter_sub(uint8_t *row, size_t rowbytes, size_t bpp) {
+    
+#ifdef IM_X86
+    if (im_cpu_has_sse2) {
+        if (bpp == 4) { im_unfilter_sub_4bpp_sse2(row, rowbytes); return; }
+        if (bpp == 3) { im_unfilter_sub_3bpp_sse2(row, rowbytes); return; }
+    }
+#endif
+#ifdef IM_CAN_COMPILE_NEON
+    if (im_cpu_has_neon) {
+        if (bpp == 4) { im_unfilter_sub_4bpp_neon(row, rowbytes); return; }
+        if (bpp == 3) { im_unfilter_sub_3bpp_neon(row, rowbytes); return; }
+    }
+#endif
+    im_unfilter_sub_scalar(row, rowbytes, bpp);
+}
+
+static void im_unfilter_avg(uint8_t *row, const uint8_t *prev, size_t rowbytes, size_t bpp) {
+    
+#ifdef IM_X86
+    if (im_cpu_has_sse2 && bpp == 4) {
+        im_unfilter_avg_4bpp_sse2(row, prev, rowbytes);
+        return;
+    }
+#endif
+#ifdef IM_CAN_COMPILE_NEON
+    if (im_cpu_has_neon && bpp == 4) {
+        im_unfilter_avg_4bpp_neon(row, prev, rowbytes);
+        return;
+    }
+#endif
+    im_unfilter_avg_scalar(row, prev, rowbytes, bpp);
+}
+
+static void im_unfilter_paeth(uint8_t *row, const uint8_t *prev, size_t rowbytes, size_t bpp) {
+#ifdef IM_X86
+    if (im_cpu_has_sse2 && bpp == 4) {
+        im_unfilter_paeth_4bpp_sse2(row, prev, rowbytes);
+        return;
+    }
+#endif
+#ifdef IM_CAN_COMPILE_NEON
+    if (im_cpu_has_neon && bpp == 4) {
+        im_unfilter_paeth_4bpp_neon(row, prev, rowbytes);
+        return;
+    }
+#endif
+    im_unfilter_paeth_scalar(row, prev, rowbytes, bpp);
+}
+
 void *im_memcpy(void *dest, const void *src, size_t n) {
     unsigned char *d = dest;
     const unsigned char *s = src;
@@ -235,7 +693,7 @@ int im_memcmp(const void *a, const void *b, size_t n) {
     return 0;
 }
 
-char *im__read_entire_file(const char *file_path, size_t *bytes_read) {
+unsigned char *im__read_entire_file(const char *file_path, size_t *bytes_read) {
 #ifdef _WIN32
     wchar_t* wide_path = win32_utf8_to_utf16(file_path);
     HANDLE file = NULL;
@@ -320,11 +778,11 @@ char *im__read_entire_file(const char *file_path, size_t *bytes_read) {
     if(n != (size_t)file_size) { free(buffer); return NULL; }
 
     *bytes_read = file_size;
-    return buffer;
+    return (unsigned char*)buffer;
 #endif
 }
 
-void im_png_print_bytes(void *bytes_in, size_t len) {
+void im_print_bytes(void *bytes_in, size_t len) {
     uint8_t *bytes = bytes_in;
     for(size_t i = 0; i < len; i++) {
         printf("%u ", bytes[i]);
@@ -332,17 +790,57 @@ void im_png_print_bytes(void *bytes_in, size_t len) {
     printf("\n");
 }
 
-void im_png_print_string(const char* str, size_t len) {
-    size_t i;
-    for(i = 0; i < len; i++) {
-        printf("%c ", str[i]);
+uint32_t consume_uint32(unsigned char **at, unsigned char *end_of_file) {
+    if(*at + sizeof(uint32_t) <= end_of_file) {
+        uint32_t value;
+        memcpy(&value, *at, sizeof(uint32_t));
+        *at += sizeof(uint32_t);
+        return value;
     }
-    printf("\n");
+    fprintf(stderr, "Error: %s(), will not read past end of file.\n", __func__);
+    return 0;
 }
 
-//#define consume(at, end_of_file, size) (consume_size(at, end_of_file, size))
+uint16_t consume_uint16(unsigned char **at, unsigned char *end_of_file) {
+    if(*at + sizeof(uint16_t) <= end_of_file) {
+        uint16_t value;
+        memcpy(&value, *at, sizeof(uint16_t));
+        *at += sizeof(uint16_t);
+        return value;
+    }
+    fprintf(stderr, "Error: %s(), will not read past end of file.\n", __func__);
+    return 0;
+}
 
-void *consume(char **at, char *end_of_file, size_t size) {
+uint8_t consume_uint8(unsigned char **at, unsigned char *end_of_file) {
+    uint8_t *orig = (uint8_t*)(*at);
+    if(*at + sizeof(uint8_t) <= end_of_file) {
+        *at += sizeof(uint8_t);
+        return *orig;
+    }
+    fprintf(stderr, "Error: %s(), will not read past end of file.", __func__);
+    return *orig;
+}
+
+uint32_t consume_and_swap_uint32(unsigned char **at, unsigned char *end_of_file) {
+    uint32_t value = consume_uint32(at, end_of_file);
+    value = (value << 24) | ((value << 8) & 0x00FF0000) | ((value >> 8) & 0x0000FF00) | (value >> 24);
+    return value;
+}
+
+uint16_t consume_and_swap_uint16(unsigned char **at, unsigned char *end_of_file) {
+    uint16_t value = consume_uint16(at, end_of_file);
+    value = value << 8 | value >> 8;
+    return value;
+}
+
+void endian_swap(uint32_t *start) {
+    uint32_t value = *start;
+    value = (value << 24) | ((value << 8) & 0x00FF0000) | ((value >> 8) & 0x0000FF00) | (value >> 24);
+    *start = value;
+}
+
+void *consume(unsigned char **at, unsigned char *end_of_file, size_t size) {
     void *orig = *at;
     if(*at + size <= end_of_file) {
         *at += size;
@@ -352,14 +850,8 @@ void *consume(char **at, char *end_of_file, size_t size) {
     return orig;
 }
 
-void endian_swap(uint32_t *start) {
-    uint32_t value = *start;
-    value = (value << 24) | (value << 8) & 0x00FF0000 | (value >> 8) & 0x0000FF00 | (value >> 24);
-    *start = value;
-}
-
 // this function simply assumes that you will pass in the start of the uint32_t using the at.
-void *consume_and_endian_swap(char **at, char *end_of_file, size_t size) {
+void *consume_and_endian_swap(unsigned char **at, unsigned char *end_of_file, size_t size) {
     void *value = consume(at, end_of_file, size);
     endian_swap(value);
     return value;
@@ -382,22 +874,22 @@ void im_png_parse_chunk_IHDR(im_png_info *info) {
     im_png_chunk_header header = *(im_png_chunk_header*)consume(&info->at, info->end_of_file, sizeof(im_png_chunk_header));
     endian_swap((uint32_t*)&header);
 
-    printf("Length: %d\n", header.length);
+    IM_INFO("Length: %d\n", header.length);
     if(header.length != 13u){
         IM_ERR("Length section of ihdr chunk is not 13.");
     }
 
     if(!info->first_ihdr) IM_ERR("Multiple IHDR.");
 
-    info->width = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
-    info->height = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
-    info->bits_per_channel = *(uint32_t*)consume(&info->at, info->end_of_file, 1);
-    info->color_type = *(uint32_t*)consume(&info->at, info->end_of_file, 1);
-    info->compression_method = *(uint32_t*)consume(&info->at, info->end_of_file, 1);
-    info->filter_method = *(uint32_t*)consume(&info->at, info->end_of_file, 1);
-    info->interlace_method = *(uint32_t*)consume(&info->at, info->end_of_file, 1);
+    info->width = consume_and_swap_uint32(&info->at, info->end_of_file);
+    info->height = consume_and_swap_uint32(&info->at, info->end_of_file);
+    info->bits_per_channel = consume_uint8(&info->at, info->end_of_file);
+    info->color_type = consume_uint8(&info->at, info->end_of_file);
+    info->compression_method = consume_uint8(&info->at, info->end_of_file);
+    info->filter_method = consume_uint8(&info->at, info->end_of_file);
+    info->interlace_method = consume_uint8(&info->at, info->end_of_file);
 
-    uint32_t *crc = (uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
+    uint32_t crc = consume_uint32(&info->at, info->end_of_file);
 
 #ifndef IM_NO_ERRORS
     if(info->color_type == 1 || info->color_type > 6) {
@@ -428,13 +920,13 @@ void im_png_parse_chunk_IHDR(im_png_info *info) {
         IM_ERR("Interlace method is supposed to be 0 or 1, but it's %u.", info->interlace_method);
 #endif
 
-    printf("width: %d\n", info->width);
-    printf("height: %d\n", info->height);
-    printf("bits_per_channel: %d\n", info->bits_per_channel);
-    printf("color_type: %d\n", info->color_type);
-    printf("compression_method: %d\n", info->compression_method);
-    printf("filter_method: %d\n", info->filter_method);
-    printf("interlace_method: %d\n", info->interlace_method);
+    IM_INFO("width: %d\n", info->width);
+    IM_INFO("height: %d\n", info->height);
+    IM_INFO("bits_per_channel: %d\n", info->bits_per_channel);
+    IM_INFO("color_type: %d\n", info->color_type);
+    IM_INFO("compression_method: %d\n", info->compression_method);
+    IM_INFO("filter_method: %d\n", info->filter_method);
+    IM_INFO("interlace_method: %d\n", info->interlace_method);
 
     switch(info->color_type) {
         case RGB:
@@ -463,11 +955,11 @@ void im_png_parse_chunk_IHDR(im_png_info *info) {
         IM_ERR("Length section of gAMA chunk is not 4.");
     }
 
-    uint32_t tmp  = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
+    uint32_t tmp  = consume_and_swap_uint32(&info->at, info->end_of_file);
     info->gamma = tmp / 100000.0;
-    printf("gAMA chunk: gamma = %.5f\n", info->gamma);
+    IM_INFO("gAMA chunk: gamma = %.5f\n", info->gamma);
 
-    uint32_t *crc = (uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
+    uint32_t crc = consume_uint32(&info->at, info->end_of_file);
 }
 
 void im_png_parse_chunk_cHRM(im_png_info *info) {
@@ -479,32 +971,32 @@ void im_png_parse_chunk_cHRM(im_png_info *info) {
     }
 
     uint32_t tmp;
-    tmp = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
+    tmp = consume_and_swap_uint32(&info->at, info->end_of_file);
     info->white_x = tmp / 100000.0;
-    tmp = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
+    tmp = consume_and_swap_uint32(&info->at, info->end_of_file);
     info->white_y = tmp / 100000.0;
-    tmp = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
+    tmp = consume_and_swap_uint32(&info->at, info->end_of_file);
     info->red_x = tmp / 100000.0;
-    tmp = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
+    tmp = consume_and_swap_uint32(&info->at, info->end_of_file);
     info->red_y = tmp / 100000.0;
-    tmp = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
+    tmp = consume_and_swap_uint32(&info->at, info->end_of_file);
     info->green_x = tmp / 100000.0;
-    tmp = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
+    tmp = consume_and_swap_uint32(&info->at, info->end_of_file);
     info->green_y = tmp / 100000.0;
-    tmp = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
+    tmp = consume_and_swap_uint32(&info->at, info->end_of_file);
     info->blue_x = tmp / 100000.0;
-    tmp = *(uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
+    tmp = consume_and_swap_uint32(&info->at, info->end_of_file);
     info->blue_y = tmp / 100000.0;
-    printf("white_x = %.5f\n", info->white_x);
-    printf("white_y = %.5f\n", info->white_y);
-    printf("red_x = %.5f\n", info->red_x);
-    printf("red_y = %.5f\n", info->red_y);
-    printf("green_x = %.5f\n", info->green_x);
-    printf("green_y = %.5f\n", info->green_y);
-    printf("blue_x = %.5f\n", info->blue_x);
-    printf("blue_y = %.5f\n", info->blue_y);
+    IM_INFO("white_x = %.5f\n", info->white_x);
+    IM_INFO("white_y = %.5f\n", info->white_y);
+    IM_INFO("red_x = %.5f\n", info->red_x);
+    IM_INFO("red_y = %.5f\n", info->red_y);
+    IM_INFO("green_x = %.5f\n", info->green_x);
+    IM_INFO("green_y = %.5f\n", info->green_y);
+    IM_INFO("blue_x = %.5f\n", info->blue_x);
+    IM_INFO("blue_y = %.5f\n", info->blue_y);
 
-    uint32_t *crc = (uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
+    uint32_t crc = consume_uint32(&info->at, info->end_of_file);
 }
 
 void im_png_parse_chunk_bKGD(im_png_info *info) {
@@ -519,7 +1011,7 @@ void im_png_parse_chunk_bKGD(im_png_info *info) {
                 IM_ERR("For color type %d, data len is supposed to be 2. data_len is: %d.", info->color_type, header.length);
             }
             #endif
-            info->bkgd_gray = *(uint16_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint16_t));
+            info->bkgd_gray = consume_uint16(&info->at, info->end_of_file);
             break;
         }
         case 2:
@@ -529,9 +1021,9 @@ void im_png_parse_chunk_bKGD(im_png_info *info) {
                 IM_ERR("For color type %d, data_len is supposed to be 6. data_len is: %d.", info->color_type, header.length);
             }
             #endif
-            info->bkgd_r = *(uint16_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint16_t));
-            info->bkgd_g = *(uint16_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint16_t));
-            info->bkgd_b = *(uint16_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint16_t));
+            info->bkgd_r = consume_uint16(&info->at, info->end_of_file);
+            info->bkgd_g = consume_uint16(&info->at, info->end_of_file);
+            info->bkgd_b = consume_uint16(&info->at, info->end_of_file);
             break;
         }
         case 3: {
@@ -540,12 +1032,12 @@ void im_png_parse_chunk_bKGD(im_png_info *info) {
                 IM_ERR("For color type 3, data_len is supposed to be 1. data_len is: %d.", header.length);
             }
             #endif
-            info->bkgd_palette_idx = *(uint8_t*)consume(&info->at, info->end_of_file, sizeof(uint8_t));
+            info->bkgd_palette_idx = consume_uint8(&info->at, info->end_of_file);
             break;
         }
     }
 
-    uint32_t *crc = (uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
+    uint32_t crc = consume_uint32(&info->at, info->end_of_file);
 }
 
 void im_png_parse_chunk_tIME(im_png_info *info) {
@@ -556,36 +1048,36 @@ void im_png_parse_chunk_tIME(im_png_info *info) {
         IM_ERR("Length section of tIME chunk is not 13.");
     }
 
-    info->year = *(uint16_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint16_t));
-    info->month = *(uint8_t*)consume(&info->at, info->end_of_file, sizeof(uint8_t));
-    info->day = *(uint8_t*)consume(&info->at, info->end_of_file, sizeof(uint8_t));
-    info->hour = *(uint8_t*)consume(&info->at, info->end_of_file, sizeof(uint8_t));
-    info->minute = *(uint8_t*)consume(&info->at, info->end_of_file, sizeof(uint8_t));
-    info->second = *(uint8_t*)consume(&info->at, info->end_of_file, sizeof(uint8_t));
+    info->year = consume_uint16(&info->at, info->end_of_file);
+    info->month = consume_uint8(&info->at, info->end_of_file);
+    info->day = consume_uint8(&info->at, info->end_of_file);
+    info->hour = consume_uint8(&info->at, info->end_of_file);
+    info->minute = consume_uint8(&info->at, info->end_of_file);
+    info->second = consume_uint8(&info->at, info->end_of_file);
 
-    uint32_t *crc = (uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
+    uint32_t crc = consume_uint32(&info->at, info->end_of_file);
 }
 
 void im_png_parse_chunk_tEXt(im_png_info *info) {
     im_png_chunk_header header = *(im_png_chunk_header*)consume(&info->at, info->end_of_file, sizeof(im_png_chunk_header));
     endian_swap((uint32_t*)&header);
 
-    char keyword[80] = {0};
-    char at = 0;
+    unsigned char keyword[80] = {0};
+    unsigned char at = 0;
     int counter = 0;
     do {
         if(counter >= 79) break;
-        at = *(char*)consume(&info->at, info->end_of_file, 1);
+        at = *(unsigned char*)consume(&info->at, info->end_of_file, 1);
         keyword[counter++] = at;
     } while(at != '\0');
 
     size_t text_len = header.length - counter;
-    char *text = (char*)consume(&info->at, info->end_of_file, 1);
+    unsigned char *text = (unsigned char*)consume(&info->at, info->end_of_file, 1);
     consume(&info->at, info->end_of_file, text_len - 1);
 
-    printf("%s %.*s\n", keyword, text_len, text);
+    IM_INFO("%s %.*s\n", keyword, (int)text_len, text);
 
-    uint32_t *crc = (uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
+    uint32_t crc = consume_uint32(&info->at, info->end_of_file);
 }
 
 void im_png_parse_chunk_IEND(im_png_info *info) {
@@ -596,10 +1088,10 @@ void im_png_parse_chunk_IEND(im_png_info *info) {
         IM_ERR("Length section of IEND chunk is not 0.");
     }
 
-    uint32_t *crc = (uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
+    uint32_t crc = consume_uint32(&info->at, info->end_of_file);
 }
 
-char *get_next_chunk_type(im_png_info *info) {
+unsigned char *get_next_chunk_type(im_png_info *info) {
     if(info->at + PNG_CHUNK_DATA_LEN < info->end_of_file) {
         return info->at + PNG_CHUNK_DATA_LEN;
     } else {
@@ -610,53 +1102,28 @@ char *get_next_chunk_type(im_png_info *info) {
 
 /* Skip the chunk length(4 bytes), chunk type (4 bytes), chunk data, and CRC (4 bytes) */
 void skip_chunk(im_png_info *info) {
-    uint32_t *length = (uint32_t*)consume_and_endian_swap(&info->at, info->end_of_file, sizeof(uint32_t));
-
-    size_t bytes_needed_to_skip_chunk = PNG_CHUNK_TYPE_LEN + *length + PNG_CHUNK_CRC_LEN;
-
-    /* Advance the offset */
+    uint32_t length = consume_and_swap_uint32(&info->at, info->end_of_file);
+    size_t bytes_needed_to_skip_chunk = PNG_CHUNK_TYPE_LEN + length + PNG_CHUNK_CRC_LEN;
     info->at += bytes_needed_to_skip_chunk;
 }
 
-void im_png_peek_bytes(im_png_info *info, void* buf, char *offset, const size_t bytes_to_read) {
+void im_png_peek_bytes(im_png_info *info, void* buf, unsigned char *offset, const size_t bytes_to_read) {
     if(offset < info->end_of_file) {
         im_memcpy(buf, offset, bytes_to_read);
     } else {
-        fprintf(stderr, "Error: %s(): tried to read bytes past end of file, not going to read.", __func__);
+        IM_ERR("Error: %s(): tried to read bytes past end of file, not going to read.", __func__);
     }
 }
 
-char* im_png_peek_next_chunk(im_png_info *info, char *current_chunk) {
+unsigned char* im_png_peek_next_chunk(im_png_info *info, unsigned char *current_chunk) {
     uint32_t data_length = 0;
     im_png_peek_bytes(info, &data_length, current_chunk, PNG_CHUNK_DATA_LEN);
     endian_swap(&data_length);
-    printf("DATA LENGTH: %d\n", data_length);
+    IM_INFO("DATA LENGTH: %d\n", data_length);
 
     return current_chunk + PNG_CHUNK_DATA_LEN + PNG_CHUNK_TYPE_LEN + data_length + PNG_CHUNK_CRC_LEN;
 }
 
-typedef struct {
-    uint8_t *data;
-    size_t bitpos; /* bit offset from start */
-} im_bitsream;
-
-uint32_t consume_bits(im_bitsream *bs, int n) {
-    uint32_t val = 0;
-    for (int i = 0; i < n; i++) {
-        size_t byte_index = bs->bitpos / 8;
-        int bit_index = bs->bitpos % 8;
-        val |= ((bs->data[byte_index] >> bit_index) & 1) << i;
-        bs->bitpos++;
-    }
-    return val;
-}
-
-void align_next_byte(im_bitsream *bs) {
-    size_t bits_out_of_alignment = bs->bitpos & 7;
-    if(bits_out_of_alignment) {
-        consume_bits(bs, 8 - bits_out_of_alignment);
-    }
-}
 
 void im_memset(void *buffer, int value, size_t count) {
     unsigned char *buf = buffer;
@@ -664,186 +1131,297 @@ void im_memset(void *buffer, int value, size_t count) {
         buf[i] = value;
     }
 }
+typedef struct {
+    const uint8_t *data;
+    const uint8_t *end;
+    uint64_t bits;
+    int count;
+} im_bitstream;
 
+static void bs_init(im_bitstream *bs, const uint8_t *data, size_t len) {
+    bs->data = data;
+    bs->end = data + len;
+    bs->bits = 0;
+    bs->count = 0;
+}
+
+static void bs_refill(im_bitstream *bs) {
+    while (bs->count <= 56 && bs->data < bs->end) {
+        bs->bits |= (uint64_t)(*bs->data++) << bs->count;
+        bs->count += 8;
+    }
+}
+
+static uint32_t bs_peek(im_bitstream *bs, int n) {
+    if (bs->count < n) bs_refill(bs);
+    return bs->bits & ((1ULL << n) - 1);
+}
+
+static void bs_drop(im_bitstream *bs, int n) {
+    bs->bits >>= n;
+    bs->count -= n;
+}
+
+static uint32_t bs_read(im_bitstream *bs, int n) {
+    uint32_t v = bs_peek(bs, n);
+    bs_drop(bs, n);
+    return v;
+}
+
+static void bs_align(im_bitstream *bs) {
+    int discard = bs->count & 7;
+    if (discard) bs_drop(bs, discard);
+}
+
+#define HUFF_FAST_BITS 9
+#define HUFF_FAST_SIZE (1 << HUFF_FAST_BITS)  /* 512 */
+
+/* Entry format: symbol (10 bits) | length (4 bits) | slow_flag (1 bit) */
+#define HUFF_SYM_MASK  0x3FF    /* bits 0-9: symbol (max 1023) */
+#define HUFF_LEN_SHIFT 10
+#define HUFF_LEN_MASK  0xF      /* bits 10-13: length (1-15) */
+#define HUFF_SLOW_FLAG 0x8000   /* bit 15: needs slow decode */
 
 typedef struct {
-    int len;
-    int code;
-}huffman_tree;
+    uint16_t fast[HUFF_FAST_SIZE];  /* Fast lookup for codes <= 9 bits */
+    /* Slow path storage for codes > 9 bits */
+    uint16_t slow_sym[320];         /* Symbol for each long code */
+    uint8_t  slow_len[320];         /* Length for each long code */
+    uint32_t slow_code[320];        /* Reversed code bits */
+    int slow_count;                 /* Number of long codes */
+    int max_length;                 /* Maximum code length */
+} im_huffman_table;
 
-#define FIXED_LITERAL_COUNT 288
-#define FIXED_DISTANCE_COUNT 32
-huffman_tree literal_length_tree[FIXED_LITERAL_COUNT];
-huffman_tree distance_tree[FIXED_DISTANCE_COUNT];
+/* Reverse the bottom n bits of a value */
 
-void im_png_build_fixed_huffman_tree() {
-    static const uint8_t fixed_literal_length_code_lengths[FIXED_LITERAL_COUNT] = {
-        /* literal values are from 0 to 255 */
-        /* 0 ... 143 = 144 */
-        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
-        /* 144 ... 255 = 112 */
-        9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
-        /* length values are from 257 to 285 (256 signifies end of block)*/
-        /* 256 - 279 */
-        7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-        /* 280 - 287 */
-        8, 8, 8, 8, 8, 8, 8, 8
-    };
+/*
+ * Build a fast Huffman lookup table from code lengths.
+ * 
+ * lengths: array of code lengths for each symbol (0 = symbol not used)
+ * count: number of symbols
+ * table: output table structure (must be zeroed before first call)
+ *
+ * Returns 0 on success, -1 on error.
+ */
 
-    static const uint8_t fixed_distance_code_lengths[FIXED_DISTANCE_COUNT] = {
-        5, 5, 5, 5, 5, 5, 5, 5,
-        5, 5, 5, 5, 5, 5, 5, 5,
-        5, 5, 5, 5, 5, 5, 5, 5,
-        5, 5, 5, 5, 5, 5, 5, 5,
-    };
-
-    #define MAX_BITS 9 /* dynamic huffman would use 15 bits, we are just using 9 here because it's big enough for the fixed lengths */
-    int code, bits;
-    int next_code[MAX_BITS + 1] = {0};
-    int bl_count[MAX_BITS + 1];
-
-    /* literal-length tree generation */
-    bl_count[0] = 0;
-    bl_count[1] = 0;
-    bl_count[2] = 0;
-    bl_count[3] = 0;
-    bl_count[4] = 0;
-    bl_count[5] = 0;
-    bl_count[6] = 0;
-    bl_count[7] = 24;
-    bl_count[8] = 152;
-    bl_count[9] = 112;
-
-    for (bits = 1, code = 0; bits <= MAX_BITS; bits++) {
-        code = (code + bl_count[bits-1]) << 1;
-        next_code[bits] = code;
+static uint32_t im_huff_bit_reverse(uint32_t val, int n) {
+    uint32_t r = 0;
+    for (int i = 0; i < n; i++) {
+        r = (r << 1) | (val & 1);
+        val >>= 1;
     }
-
-    for (int n = 0; n < FIXED_LITERAL_COUNT; n++) {
-        int len = fixed_literal_length_code_lengths[n];
-        literal_length_tree[n].len = len;
-
-        if (len != 0) {
-            literal_length_tree[n].code = next_code[len]++;
-        } else {
-            literal_length_tree[n].code = 0;
-        }
-
-    }
-
-    /* distance tree generation */
-    bl_count[0] = 0;
-    bl_count[1] = 0;
-    bl_count[2] = 0;
-    bl_count[3] = 0;
-    bl_count[4] = 0;
-    bl_count[5] = 32;
-    bl_count[6] = 0;
-    bl_count[7] = 0;
-    bl_count[8] = 0;
-    bl_count[9] = 0;
-
-    for (bits = 1, code = 0; bits <= MAX_BITS; bits++) {
-        code = (code + bl_count[bits-1]) << 1;
-        next_code[bits] = code;
-    }
-
-    for (int n = 0; n < FIXED_DISTANCE_COUNT; n++) {
-        int len = fixed_distance_code_lengths[n];
-        distance_tree[n].len = len;
-
-        if (len != 0) {
-            distance_tree[n].code = next_code[len]++;
-        } else {
-            distance_tree[n].code = 0;
-        }
-
-    }
-
+    return r;
 }
 
-// Paeth predictor function for filter type 4
-static uint8_t paeth_predictor(uint8_t a, uint8_t b, uint8_t c) {
-    int p = a + b - c;
-    int pa = abs(p - a);
-    int pb = abs(p - b);
-    int pc = abs(p - c);
+static int im_build_huffman_table(im_huffman_table *table, const uint8_t *lengths, int count) {
+    int bl_count[16] = {0};
+    int next_code[16] = {0};
+    int max_len = 0;
     
-    if (pa <= pb && pa <= pc) return a;
-    else if (pb <= pc) return b;
-    else return c;
-}
-
-// Unfilter the decompressed image data
-static void im_png_unfilter(im_png_info *info) {
-    size_t bytes_per_pixel = (info->bits_per_channel * info->channel_count + 7) / 8;
-    size_t bytes_per_scanline = (info->width * info->channel_count * info->bits_per_channel + 7) / 8;
-    size_t stride = bytes_per_scanline + 1; // +1 for filter byte
+    for (int i = 0; i < HUFF_FAST_SIZE; i++) table->fast[i] = 0;
+    table->slow_count = 0;
+    table->max_length = 0;
     
-    printf("Unfiltering: bytes_per_pixel=%zu, bytes_per_scanline=%zu\n", bytes_per_pixel, bytes_per_scanline);
+    for (int i = 0; i < count; i++) {
+        if (lengths[i] > 0 && lengths[i] <= 15) {
+            bl_count[lengths[i]]++;
+            if (lengths[i] > max_len) max_len = lengths[i];
+        }
+    }
+    table->max_length = max_len;
+    if (max_len == 0) return 0;
     
-    for (size_t y = 0; y < info->height; y++) {
-        size_t scanline_offset = y * stride;
-        uint8_t filter_type = info->png_pixels[scanline_offset];
-        uint8_t *scanline = (uint8_t*)info->png_pixels + scanline_offset + 1;
-        uint8_t *prev_scanline = (y > 0) ? (uint8_t*)info->png_pixels + (y - 1) * stride + 1 : NULL;
+    int code = 0;
+    for (int bits = 1; bits <= 15; bits++) {
+        code = (code + bl_count[bits - 1]) << 1;
+        next_code[bits] = code;
+    }
+    
+    for (int sym = 0; sym < count; sym++) {
+        int len = lengths[sym];
+        if (len == 0) continue;
         
-        switch (filter_type) {
-            case 0: // None
-                break;
-                
-            case 1: // Sub
-                for (size_t x = bytes_per_pixel; x < bytes_per_scanline; x++) {
-                    scanline[x] = (scanline[x] + scanline[x - bytes_per_pixel]) & 0xFF;
-                }
-                break;
-                
-            case 2: // Up
-                if (prev_scanline) {
-                    for (size_t x = 0; x < bytes_per_scanline; x++) {
-                        scanline[x] = (scanline[x] + prev_scanline[x]) & 0xFF;
-                    }
-                }
-                break;
-                
-            case 3: // Average
-                for (size_t x = 0; x < bytes_per_scanline; x++) {
-                    uint8_t left = (x >= bytes_per_pixel) ? scanline[x - bytes_per_pixel] : 0;
-                    uint8_t up = prev_scanline ? prev_scanline[x] : 0;
-                    scanline[x] = (scanline[x] + ((left + up) / 2)) & 0xFF;
-                }
-                break;
-                
-            case 4: // Paeth
-                for (size_t x = 0; x < bytes_per_scanline; x++) {
-                    uint8_t left = (x >= bytes_per_pixel) ? scanline[x - bytes_per_pixel] : 0;
-                    uint8_t up = prev_scanline ? prev_scanline[x] : 0;
-                    uint8_t up_left = (prev_scanline && x >= bytes_per_pixel) ? prev_scanline[x - bytes_per_pixel] : 0;
-                    scanline[x] = (scanline[x] + paeth_predictor(left, up, up_left)) & 0xFF;
-                }
-                break;
-                
-            default:
-                IM_ERR("Unknown filter type: %d", filter_type);
-                break;
+        int c = next_code[len]++;
+        uint32_t rev = im_huff_bit_reverse(c, len);
+        
+        if (len <= HUFF_FAST_BITS) {
+            uint16_t entry = (uint16_t)(sym | (len << HUFF_LEN_SHIFT));
+            int fill = 1 << (HUFF_FAST_BITS - len);
+            for (int j = 0; j < fill; j++) {
+                table->fast[rev | (j << len)] = entry;
+            }
+        } else {
+            table->fast[rev & (HUFF_FAST_SIZE - 1)] = HUFF_SLOW_FLAG;
+            if (table->slow_count < 320) {
+                int si = table->slow_count++;
+                table->slow_sym[si] = sym;
+                table->slow_len[si] = len;
+                table->slow_code[si] = rev;
+            }
         }
     }
     
-    // Now remove the filter bytes and compact the data
-    unsigned char *unfiltered = malloc(info->height * bytes_per_scanline);
-    if (!unfiltered) {
-        IM_ERR("Failed to allocate memory for unfiltered data");
-        return;
-    }
+    return 0;
+}
+
+/*
+ * Decode one symbol from the bitstream using the Huffman table.
+ * Returns the symbol value (0-285 for lit/len, 0-31 for dist) or -1 on error.
+ */
+
+/* Fixed literal/length table (symbols 0-285) */
+static const uint16_t im_fixed_lit_table[512] = {
+    0x1D00,0x2050,0x2010,0x2118,0x1D10,0x2070,0x2030,0x24C0,0x1D08,0x2060,0x2020,0x24A0,0x2000,0x2080,0x2040,0x24E0,
+    0x1D04,0x2058,0x2018,0x2490,0x1D14,0x2078,0x2038,0x24D0,0x1D0C,0x2068,0x2028,0x24B0,0x2008,0x2088,0x2048,0x24F0,
+    0x1D02,0x2054,0x2014,0x211C,0x1D12,0x2074,0x2034,0x24C8,0x1D0A,0x2064,0x2024,0x24A8,0x2004,0x2084,0x2044,0x24E8,
+    0x1D06,0x205C,0x201C,0x2498,0x1D16,0x207C,0x203C,0x24D8,0x1D0E,0x206C,0x202C,0x24B8,0x200C,0x208C,0x204C,0x24F8,
+    0x1D01,0x2052,0x2012,0x211A,0x1D11,0x2072,0x2032,0x24C4,0x1D09,0x2062,0x2022,0x24A4,0x2002,0x2082,0x2042,0x24E4,
+    0x1D05,0x205A,0x201A,0x2494,0x1D15,0x207A,0x203A,0x24D4,0x1D0D,0x206A,0x202A,0x24B4,0x200A,0x208A,0x204A,0x24F4,
+    0x1D03,0x2056,0x2016,0x211E,0x1D13,0x2076,0x2036,0x24CC,0x1D0B,0x2066,0x2026,0x24AC,0x2006,0x2086,0x2046,0x24EC,
+    0x1D07,0x205E,0x201E,0x249C,0x1D17,0x207E,0x203E,0x24DC,0x1D0F,0x206E,0x202E,0x24BC,0x200E,0x208E,0x204E,0x24FC,
+    0x1D00,0x2051,0x2011,0x2119,0x1D10,0x2071,0x2031,0x24C2,0x1D08,0x2061,0x2021,0x24A2,0x2001,0x2081,0x2041,0x24E2,
+    0x1D04,0x2059,0x2019,0x2492,0x1D14,0x2079,0x2039,0x24D2,0x1D0C,0x2069,0x2029,0x24B2,0x2009,0x2089,0x2049,0x24F2,
+    0x1D02,0x2055,0x2015,0x211D,0x1D12,0x2075,0x2035,0x24CA,0x1D0A,0x2065,0x2025,0x24AA,0x2005,0x2085,0x2045,0x24EA,
+    0x1D06,0x205D,0x201D,0x249A,0x1D16,0x207D,0x203D,0x24DA,0x1D0E,0x206D,0x202D,0x24BA,0x200D,0x208D,0x204D,0x24FA,
+    0x1D01,0x2053,0x2013,0x211B,0x1D11,0x2073,0x2033,0x24C6,0x1D09,0x2063,0x2023,0x24A6,0x2003,0x2083,0x2043,0x24E6,
+    0x1D05,0x205B,0x201B,0x2496,0x1D15,0x207B,0x203B,0x24D6,0x1D0D,0x206B,0x202B,0x24B6,0x200B,0x208B,0x204B,0x24F6,
+    0x1D03,0x2057,0x2017,0x211F,0x1D13,0x2077,0x2037,0x24CE,0x1D0B,0x2067,0x2027,0x24AE,0x2007,0x2087,0x2047,0x24EE,
+    0x1D07,0x205F,0x201F,0x249E,0x1D17,0x207F,0x203F,0x24DE,0x1D0F,0x206F,0x202F,0x24BE,0x200F,0x208F,0x204F,0x24FE,
+    0x1D00,0x2050,0x2010,0x2118,0x1D10,0x2070,0x2030,0x24C1,0x1D08,0x2060,0x2020,0x24A1,0x2000,0x2080,0x2040,0x24E1,
+    0x1D04,0x2058,0x2018,0x2491,0x1D14,0x2078,0x2038,0x24D1,0x1D0C,0x2068,0x2028,0x24B1,0x2008,0x2088,0x2048,0x24F1,
+    0x1D02,0x2054,0x2014,0x211C,0x1D12,0x2074,0x2034,0x24C9,0x1D0A,0x2064,0x2024,0x24A9,0x2004,0x2084,0x2044,0x24E9,
+    0x1D06,0x205C,0x201C,0x2499,0x1D16,0x207C,0x203C,0x24D9,0x1D0E,0x206C,0x202C,0x24B9,0x200C,0x208C,0x204C,0x24F9,
+    0x1D01,0x2052,0x2012,0x211A,0x1D11,0x2072,0x2032,0x24C5,0x1D09,0x2062,0x2022,0x24A5,0x2002,0x2082,0x2042,0x24E5,
+    0x1D05,0x205A,0x201A,0x2495,0x1D15,0x207A,0x203A,0x24D5,0x1D0D,0x206A,0x202A,0x24B5,0x200A,0x208A,0x204A,0x24F5,
+    0x1D03,0x2056,0x2016,0x211E,0x1D13,0x2076,0x2036,0x24CD,0x1D0B,0x2066,0x2026,0x24AD,0x2006,0x2086,0x2046,0x24ED,
+    0x1D07,0x205E,0x201E,0x249D,0x1D17,0x207E,0x203E,0x24DD,0x1D0F,0x206E,0x202E,0x24BD,0x200E,0x208E,0x204E,0x24FD,
+    0x1D00,0x2051,0x2011,0x2119,0x1D10,0x2071,0x2031,0x24C3,0x1D08,0x2061,0x2021,0x24A3,0x2001,0x2081,0x2041,0x24E3,
+    0x1D04,0x2059,0x2019,0x2493,0x1D14,0x2079,0x2039,0x24D3,0x1D0C,0x2069,0x2029,0x24B3,0x2009,0x2089,0x2049,0x24F3,
+    0x1D02,0x2055,0x2015,0x211D,0x1D12,0x2075,0x2035,0x24CB,0x1D0A,0x2065,0x2025,0x24AB,0x2005,0x2085,0x2045,0x24EB,
+    0x1D06,0x205D,0x201D,0x249B,0x1D16,0x207D,0x203D,0x24DB,0x1D0E,0x206D,0x202D,0x24BB,0x200D,0x208D,0x204D,0x24FB,
+    0x1D01,0x2053,0x2013,0x211B,0x1D11,0x2073,0x2033,0x24C7,0x1D09,0x2063,0x2023,0x24A7,0x2003,0x2083,0x2043,0x24E7,
+    0x1D05,0x205B,0x201B,0x2497,0x1D15,0x207B,0x203B,0x24D7,0x1D0D,0x206B,0x202B,0x24B7,0x200B,0x208B,0x204B,0x24F7,
+    0x1D03,0x2057,0x2017,0x211F,0x1D13,0x2077,0x2037,0x24CF,0x1D0B,0x2067,0x2027,0x24AF,0x2007,0x2087,0x2047,0x24EF,
+    0x1D07,0x205F,0x201F,0x249F,0x1D17,0x207F,0x203F,0x24DF,0x1D0F,0x206F,0x202F,0x24BF,0x200F,0x208F,0x204F,0x24FF
+};
+
+/* Fixed distance table (symbols 0-31, all 5-bit codes) */
+static const uint16_t im_fixed_dist_table[512] = {
+    0x1400,0x1410,0x1408,0x1418,0x1404,0x1414,0x140C,0x141C,0x1402,0x1412,0x140A,0x141A,0x1406,0x1416,0x140E,0x141E,
+    0x1401,0x1411,0x1409,0x1419,0x1405,0x1415,0x140D,0x141D,0x1403,0x1413,0x140B,0x141B,0x1407,0x1417,0x140F,0x141F,
+    0x1400,0x1410,0x1408,0x1418,0x1404,0x1414,0x140C,0x141C,0x1402,0x1412,0x140A,0x141A,0x1406,0x1416,0x140E,0x141E,
+    0x1401,0x1411,0x1409,0x1419,0x1405,0x1415,0x140D,0x141D,0x1403,0x1413,0x140B,0x141B,0x1407,0x1417,0x140F,0x141F,
+    0x1400,0x1410,0x1408,0x1418,0x1404,0x1414,0x140C,0x141C,0x1402,0x1412,0x140A,0x141A,0x1406,0x1416,0x140E,0x141E,
+    0x1401,0x1411,0x1409,0x1419,0x1405,0x1415,0x140D,0x141D,0x1403,0x1413,0x140B,0x141B,0x1407,0x1417,0x140F,0x141F,
+    0x1400,0x1410,0x1408,0x1418,0x1404,0x1414,0x140C,0x141C,0x1402,0x1412,0x140A,0x141A,0x1406,0x1416,0x140E,0x141E,
+    0x1401,0x1411,0x1409,0x1419,0x1405,0x1415,0x140D,0x141D,0x1403,0x1413,0x140B,0x141B,0x1407,0x1417,0x140F,0x141F,
+    0x1400,0x1410,0x1408,0x1418,0x1404,0x1414,0x140C,0x141C,0x1402,0x1412,0x140A,0x141A,0x1406,0x1416,0x140E,0x141E,
+    0x1401,0x1411,0x1409,0x1419,0x1405,0x1415,0x140D,0x141D,0x1403,0x1413,0x140B,0x141B,0x1407,0x1417,0x140F,0x141F,
+    0x1400,0x1410,0x1408,0x1418,0x1404,0x1414,0x140C,0x141C,0x1402,0x1412,0x140A,0x141A,0x1406,0x1416,0x140E,0x141E,
+    0x1401,0x1411,0x1409,0x1419,0x1405,0x1415,0x140D,0x141D,0x1403,0x1413,0x140B,0x141B,0x1407,0x1417,0x140F,0x141F,
+    0x1400,0x1410,0x1408,0x1418,0x1404,0x1414,0x140C,0x141C,0x1402,0x1412,0x140A,0x141A,0x1406,0x1416,0x140E,0x141E,
+    0x1401,0x1411,0x1409,0x1419,0x1405,0x1415,0x140D,0x141D,0x1403,0x1413,0x140B,0x141B,0x1407,0x1417,0x140F,0x141F,
+    0x1400,0x1410,0x1408,0x1418,0x1404,0x1414,0x140C,0x141C,0x1402,0x1412,0x140A,0x141A,0x1406,0x1416,0x140E,0x141E,
+    0x1401,0x1411,0x1409,0x1419,0x1405,0x1415,0x140D,0x141D,0x1403,0x1413,0x140B,0x141B,0x1407,0x1417,0x140F,0x141F,
+    0x1400,0x1410,0x1408,0x1418,0x1404,0x1414,0x140C,0x141C,0x1402,0x1412,0x140A,0x141A,0x1406,0x1416,0x140E,0x141E,
+    0x1401,0x1411,0x1409,0x1419,0x1405,0x1415,0x140D,0x141D,0x1403,0x1413,0x140B,0x141B,0x1407,0x1417,0x140F,0x141F,
+    0x1400,0x1410,0x1408,0x1418,0x1404,0x1414,0x140C,0x141C,0x1402,0x1412,0x140A,0x141A,0x1406,0x1416,0x140E,0x141E,
+    0x1401,0x1411,0x1409,0x1419,0x1405,0x1415,0x140D,0x141D,0x1403,0x1413,0x140B,0x141B,0x1407,0x1417,0x140F,0x141F,
+    0x1400,0x1410,0x1408,0x1418,0x1404,0x1414,0x140C,0x141C,0x1402,0x1412,0x140A,0x141A,0x1406,0x1416,0x140E,0x141E,
+    0x1401,0x1411,0x1409,0x1419,0x1405,0x1415,0x140D,0x141D,0x1403,0x1413,0x140B,0x141B,0x1407,0x1417,0x140F,0x141F,
+    0x1400,0x1410,0x1408,0x1418,0x1404,0x1414,0x140C,0x141C,0x1402,0x1412,0x140A,0x141A,0x1406,0x1416,0x140E,0x141E,
+    0x1401,0x1411,0x1409,0x1419,0x1405,0x1415,0x140D,0x141D,0x1403,0x1413,0x140B,0x141B,0x1407,0x1417,0x140F,0x141F,
+    0x1400,0x1410,0x1408,0x1418,0x1404,0x1414,0x140C,0x141C,0x1402,0x1412,0x140A,0x141A,0x1406,0x1416,0x140E,0x141E,
+    0x1401,0x1411,0x1409,0x1419,0x1405,0x1415,0x140D,0x141D,0x1403,0x1413,0x140B,0x141B,0x1407,0x1417,0x140F,0x141F,
+    0x1400,0x1410,0x1408,0x1418,0x1404,0x1414,0x140C,0x141C,0x1402,0x1412,0x140A,0x141A,0x1406,0x1416,0x140E,0x141E,
+    0x1401,0x1411,0x1409,0x1419,0x1405,0x1415,0x140D,0x141D,0x1403,0x1413,0x140B,0x141B,0x1407,0x1417,0x140F,0x141F,
+    0x1400,0x1410,0x1408,0x1418,0x1404,0x1414,0x140C,0x141C,0x1402,0x1412,0x140A,0x141A,0x1406,0x1416,0x140E,0x141E,
+    0x1401,0x1411,0x1409,0x1419,0x1405,0x1415,0x140D,0x141D,0x1403,0x1413,0x140B,0x141B,0x1407,0x1417,0x140F,0x141F,
+    0x1400,0x1410,0x1408,0x1418,0x1404,0x1414,0x140C,0x141C,0x1402,0x1412,0x140A,0x141A,0x1406,0x1416,0x140E,0x141E,
+    0x1401,0x1411,0x1409,0x1419,0x1405,0x1415,0x140D,0x141D,0x1403,0x1413,0x140B,0x141B,0x1407,0x1417,0x140F,0x141F
+};
+static const uint16_t im_length_base[29] = {
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
+    35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258
+};
+
+/* Extra bits to read for each length code */
+static const uint8_t im_length_extra[29] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+    3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0
+};
+
+/* Distance codes 0-29 map to these base distances */
+static const uint16_t im_distance_base[30] = {
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
+    257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145,
+    8193, 12289, 16385, 24577
+};
+
+/* Extra bits to read for each distance code */
+static const uint8_t im_distance_extra[30] = {
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
+    7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13
+};
+
+static const uint8_t im_fixed_literal_lengths[288] = {
+    /* 0-143: length 8 */
+    8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,
+    8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,
+    8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,
+    8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,
+    8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,
+    /* 144-255: length 9 */
+    9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,
+    9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,
+    9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,
+    9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,
+    /* 256-279: length 7 */
+    7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
+    /* 280-287: length 8 */
+    8,8,8,8,8,8,8,8
+};
+
+static const uint8_t im_fixed_distance_lengths[32] = {
+    5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5
+};
+
+static void im_png_unfilter(im_png_info *info) {
+    size_t bpp = (info->bits_per_channel * info->channel_count + 7) / 8;
+    size_t rowbytes = (info->width * info->channel_count * info->bits_per_channel + 7) / 8;
+    size_t stride = rowbytes + 1;
+    
+    uint8_t *data = (uint8_t*)info->png_pixels;
+    
+    /* Zero row for first scanline's "previous" */
+    uint8_t *zero_row = (uint8_t*)calloc(1, rowbytes);
+    if (!zero_row) return;
     
     for (size_t y = 0; y < info->height; y++) {
-        size_t src_offset = y * stride + 1; // +1 to skip filter byte
-        size_t dst_offset = y * bytes_per_scanline;
-        im_memcpy(unfiltered + dst_offset, info->png_pixels + src_offset, bytes_per_scanline);
+        uint8_t filter = data[y * stride];
+        uint8_t *row = data + y * stride + 1;
+        const uint8_t *prev = (y > 0) ? (data + (y - 1) * stride + 1) : zero_row;
+        
+        switch (filter) {
+            case 0: break;
+            case 1: im_unfilter_sub(row, rowbytes, bpp); break;
+            case 2: im_unfilter_up(row, prev, rowbytes); break;
+            case 3: im_unfilter_avg(row, prev, rowbytes, bpp); break;
+            case 4: im_unfilter_paeth(row, prev, rowbytes, bpp); break;
+        }
     }
     
-    free(info->png_pixels);
-    info->png_pixels = unfiltered;
+    free(zero_row);
+    
+    /* Compact: remove filter bytes */
+    uint8_t *compacted = (uint8_t*)malloc(info->height * rowbytes);
+    if (compacted) {
+        for (size_t y = 0; y < info->height; y++) {
+            memcpy(compacted + y * rowbytes, data + y * stride + 1, rowbytes);
+        }
+        free(info->png_pixels);
+        info->png_pixels = compacted;
+    }
 }
 
 // Length codes 257-285 map to these base lengths
@@ -870,445 +1448,570 @@ static const uint8_t distance_extra[30] = {
     7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13
 };
 
-// Decode a symbol from fixed Huffman literal/length tree
-int decode_fixed_literal_length(im_bitsream *bs) {
-    uint32_t code = 0;
-    
-    // Read 7 bits first
-    for (int i = 0; i < 7; i++) {
-        code |= consume_bits(bs, 1) << i;
-    }
-    
-    // Check for 7-bit codes (256-279)
-    if (code <= 23) {
-        return code + 256;
-    }
-    
-    // Read 8th bit
-    code |= consume_bits(bs, 1) << 7;
-    
-    // Check for 8-bit codes (0-143 and 280-287)
-    if (code >= 0x30 && code <= 0xBF) {
-        return code - 0x30; // Codes 48-191 map to symbols 0-143
-    }
-    if (code >= 0xC0 && code <= 0xC7) {
-        return code - 0xC0 + 280; // Codes 192-199 map to symbols 280-287
-    }
-    
-    // Read 9th bit
-    code |= consume_bits(bs, 1) << 8;
-    
-    // Check for 9-bit codes (144-255)
-    if (code >= 0x190 && code <= 0x1FF) {
-        return code - 0x190 + 144; // Codes 400-511 map to symbols 144-255
-    }
-    
-    return -1; // Error
-}
+/* Decode from static fixed table - inline for speed */
+#define DECODE_FIXED(bs, table, sym, len) do { \
+    uint32_t _peek = (bs)->bits & (HUFF_FAST_SIZE - 1); \
+    uint16_t _entry = (table)[_peek]; \
+    (len) = (_entry >> HUFF_LEN_SHIFT) & HUFF_LEN_MASK; \
+    (sym) = _entry & HUFF_SYM_MASK; \
+} while(0)
 
-// Decode a distance code from fixed Huffman distance tree
-int decode_fixed_distance(im_bitsream *bs) {
-    // All distance codes are 5 bits in fixed Huffman
-    uint32_t code = 0;
-    for (int i = 0; i < 5; i++) {
-        code = (code << 1) | consume_bits(bs, 1);
+/* Decode from dynamic table with slow path */
+static int huff_decode_dynamic(im_bitstream *bs, im_huffman_table *table) {
+    uint32_t peek = bs->bits & (HUFF_FAST_SIZE - 1);
+    uint16_t entry = table->fast[peek];
+    
+    if (entry != 0 && !(entry & HUFF_SLOW_FLAG)) {
+        int len = (entry >> HUFF_LEN_SHIFT) & HUFF_LEN_MASK;
+        bs_drop(bs, len);
+        return entry & HUFF_SYM_MASK;
     }
     
-    // Reverse the bits (Huffman codes are read LSB first)
-    uint32_t reversed = 0;
-    for (int i = 0; i < 5; i++) {
-        reversed = (reversed << 1) | ((code >> i) & 1);
-    }
-    
-    return reversed;
-}
-
-
-void build_huffman_tree(huffman_tree *tree, uint8_t *lengths, int count) {
-    int bl_count[16] = {0};
-    int next_code[16] = {0};
-    
-    // Count code lengths
-    for (int i = 0; i < count; i++) {
-        if (lengths[i] < 16) {
-            bl_count[lengths[i]]++;
-        }
-    }
-    
-    bl_count[0] = 0; // Codes with length 0 are not used
-    
-    // Generate starting code for each length (canonical Huffman algorithm)
-    int code = 0;
-    for (int bits = 1; bits < 16; bits++) {
-        code = (code + bl_count[bits - 1]) << 1;
-        next_code[bits] = code;
-    }
-    
-    // Assign codes to symbols
-    for (int n = 0; n < count; n++) {
-        int len = lengths[n];
-        if (len != 0) {
-            tree[n].len = len;
-            tree[n].code = next_code[len];
-            next_code[len]++;
-        } else {
-            tree[n].len = 0;
-            tree[n].code = 0;
-        }
-    }
-}
-
-
-int decode_symbol(im_bitsream *bs, huffman_tree *tree, int max_symbols) {
-    uint32_t code = 0;
-    size_t start_pos = bs->bitpos;
-    
-    for (int bits = 1; bits <= 15; bits++) {
-        // Read one bit (LSB-first from stream)
-        code |= consume_bits(bs, 1) << (bits - 1);
+    /* Slow path for long codes */
+    for (int len = HUFF_FAST_BITS + 1; len <= table->max_length; len++) {
+        if (bs->count < len) bs_refill(bs);
+        uint32_t code = bs->bits & ((1u << len) - 1);
         
-        // Reverse the code we've read to match canonical (MSB-first) order
-        uint32_t reversed_code = 0;
-        for (int b = 0; b < bits; b++) {
-            reversed_code |= ((code >> b) & 1) << (bits - 1 - b);
-        }
-        
-        // Try to match against all symbols of this bit length
-        for (int i = 0; i < max_symbols; i++) {
-            if (tree[i].len == bits && tree[i].code == reversed_code) {
-                return i;
+        for (int i = 0; i < table->slow_count; i++) {
+            if (table->slow_len[i] == len && table->slow_code[i] == code) {
+                bs_drop(bs, len);
+                return table->slow_sym[i];
             }
         }
     }
     
-    // Failed to decode - print debug info
-    printf("Failed to decode symbol starting at bit %zu, final code read: 0x%X\n", start_pos, code);
     return -1;
 }
 
-char *im_png_decompress(im_png_info *info, char *current_IDAT_chunk, size_t *idat_chunk_count) {
+/* 
+ * Safety margin for fast path: 258 is max match length in deflate.
+ * We add extra margin for the two-symbol-at-a-time optimization.
+ */
+#define INFLATE_FAST_MARGIN 258
 
+/*
+ * FAST PATH for Fixed Huffman (btype 1)
+ * No bounds checking - caller guarantees at least INFLATE_FAST_MARGIN bytes available.
+ * Returns number of bytes written, or -1 on format error.
+ * Sets *done to 1 if end-of-block reached.
+ */
+static int64_t im_inflate_fixed_fast(im_bitstream *bs, uint8_t *output, size_t out_pos, int *done) {
+    size_t start_pos = out_pos;
+    *done = 0;
+    
+    while (1) {
+        bs_refill(bs);
+        
+        int sym1, len1;
+        DECODE_FIXED(bs, im_fixed_lit_table, sym1, len1);
+        bs_drop(bs, len1);
+        
+        if (sym1 < 256) {
+            /* First symbol is literal - try to decode second */
+            int sym2, len2;
+            DECODE_FIXED(bs, im_fixed_lit_table, sym2, len2);
+            
+            if (sym2 < 256) {
+                /* Both are literals - write both! (no bounds check needed) */
+                output[out_pos++] = (uint8_t)sym1;
+                output[out_pos++] = (uint8_t)sym2;
+                bs_drop(bs, len2);
+                continue;
+            }
+            
+            /* Second is not a literal - write first, process second */
+            output[out_pos++] = (uint8_t)sym1;
+            bs_drop(bs, len2);
+            sym1 = sym2;
+        } 
+        
+        /* Handle non-literal (length/distance or end) */
+        if (sym1 == 256) {
+            *done = 1;
+            break;
+        }
+        
+        /* Length code 257-285 */
+        int len_idx = sym1 - 257;
+        if (len_idx < 0 || len_idx >= 29) return -1;
+        
+        int length = im_length_base[len_idx];
+        if (im_length_extra[len_idx] > 0) {
+            length += bs_read(bs, im_length_extra[len_idx]);
+        }
+        
+        /* Decode distance */
+        bs_refill(bs);
+        int dist_sym, dist_len;
+        DECODE_FIXED(bs, im_fixed_dist_table, dist_sym, dist_len);
+        bs_drop(bs, dist_len);
+        
+        if (dist_sym >= 30) return -1;
+        
+        int distance = im_distance_base[dist_sym];
+        if (im_distance_extra[dist_sym] > 0) {
+            distance += bs_read(bs, im_distance_extra[dist_sym]);
+        }
+        
+        if ((size_t)distance > out_pos) return -1;
+        
+        /* Copy from back-reference (no output bounds check needed) */
+        uint8_t *src = output + out_pos - distance;
+        uint8_t *dst = output + out_pos;
+        out_pos += length;
+        
+        /* Fast copy - unroll small copies for common cases */
+        if (distance == 1) {
+            /* RLE: replicate single byte */
+            memset(dst, *src, length);
+        } else if (distance >= length) {
+            /* Non-overlapping: can use memcpy */
+            memcpy(dst, src, length);
+        } else {
+            /* Overlapping: byte-by-byte */
+            for (int j = 0; j < length; j++) {
+                *dst++ = *src++;
+            }
+        }
+        
+        /* Return to caller to check if we should switch to slow path */
+        break;
+    }
+    
+    return (int64_t)(out_pos - start_pos);
+}
+
+/*
+ * SLOW PATH for Fixed Huffman (btype 1)
+ * Full bounds checking on every write.
+ * Returns number of bytes written, or -1 on error.
+ * Sets *done to 1 if end-of-block reached.
+ */
+static int64_t im_inflate_fixed_slow(im_bitstream *bs, uint8_t *output, size_t out_pos, 
+                                      size_t output_size, int *done) {
+    size_t start_pos = out_pos;
+    *done = 0;
+    
+    while (1) {
+        bs_refill(bs);
+        
+        int sym1, len1;
+        DECODE_FIXED(bs, im_fixed_lit_table, sym1, len1);
+        bs_drop(bs, len1);
+        
+        if (sym1 < 256) {
+            /* First symbol is literal - try to decode second */
+            int sym2, len2;
+            DECODE_FIXED(bs, im_fixed_lit_table, sym2, len2);
+            
+            if (sym2 < 256) {
+                /* Both are literals */
+                if (out_pos + 2 > output_size) return -1;
+                output[out_pos++] = (uint8_t)sym1;
+                output[out_pos++] = (uint8_t)sym2;
+                bs_drop(bs, len2);
+                continue;
+            }
+            
+            if (out_pos >= output_size) return -1;
+            output[out_pos++] = (uint8_t)sym1;
+            bs_drop(bs, len2);
+            sym1 = sym2;
+        } 
+        
+        if (sym1 == 256) {
+            *done = 1;
+            break;
+        }
+        
+        int len_idx = sym1 - 257;
+        if (len_idx < 0 || len_idx >= 29) return -1;
+        
+        int length = im_length_base[len_idx];
+        if (im_length_extra[len_idx] > 0) {
+            length += bs_read(bs, im_length_extra[len_idx]);
+        }
+        
+        bs_refill(bs);
+        int dist_sym, dist_len;
+        DECODE_FIXED(bs, im_fixed_dist_table, dist_sym, dist_len);
+        bs_drop(bs, dist_len);
+        
+        if (dist_sym >= 30) return -1;
+        
+        int distance = im_distance_base[dist_sym];
+        if (im_distance_extra[dist_sym] > 0) {
+            distance += bs_read(bs, im_distance_extra[dist_sym]);
+        }
+        
+        if ((size_t)distance > out_pos) return -1;
+        if (out_pos + length > output_size) return -1;
+        
+        uint8_t *src = output + out_pos - distance;
+        uint8_t *dst = output + out_pos;
+        
+        if (distance == 1) {
+            memset(dst, *src, length);
+        } else if (distance >= length) {
+            memcpy(dst, src, length);
+        } else {
+            for (int j = 0; j < length; j++) {
+                *dst++ = *src++;
+            }
+        }
+        out_pos += length;
+    }
+    
+    return (int64_t)(out_pos - start_pos);
+}
+
+/*
+ * FAST PATH for Dynamic Huffman (btype 2)
+ * No bounds checking - caller guarantees at least INFLATE_FAST_MARGIN bytes available.
+ */
+static int64_t im_inflate_dynamic_fast(im_bitstream *bs, im_huffman_table *lit_table,
+                                        im_huffman_table *dist_table, uint8_t *output,
+                                        size_t out_pos, int *done) {
+    size_t start_pos = out_pos;
+    *done = 0;
+    
+    while (1) {
+        bs_refill(bs);
+        
+        int sym1 = huff_decode_dynamic(bs, lit_table);
+        if (sym1 < 0) return -1;
+        
+        if (sym1 < 256) {
+            /* First is literal - try second */
+            int sym2 = huff_decode_dynamic(bs, lit_table);
+            if (sym2 < 0) return -1;
+            
+            if (sym2 < 256) {
+                /* Both literals (no bounds check needed) */
+                output[out_pos++] = (uint8_t)sym1;
+                output[out_pos++] = (uint8_t)sym2;
+                continue;
+            }
+            
+            output[out_pos++] = (uint8_t)sym1;
+            sym1 = sym2;
+        }
+        
+        if (sym1 == 256) {
+            *done = 1;
+            break;
+        }
+        
+        int len_idx = sym1 - 257;
+        if (len_idx < 0 || len_idx >= 29) return -1;
+        
+        int length = im_length_base[len_idx];
+        if (im_length_extra[len_idx] > 0) {
+            length += bs_read(bs, im_length_extra[len_idx]);
+        }
+        
+        bs_refill(bs);
+        int dist_sym = huff_decode_dynamic(bs, dist_table);
+        if (dist_sym < 0 || dist_sym >= 30) return -1;
+        
+        int distance = im_distance_base[dist_sym];
+        if (im_distance_extra[dist_sym] > 0) {
+            distance += bs_read(bs, im_distance_extra[dist_sym]);
+        }
+        
+        if ((size_t)distance > out_pos) return -1;
+        
+        uint8_t *src = output + out_pos - distance;
+        uint8_t *dst = output + out_pos;
+        out_pos += length;
+        
+        if (distance == 1) {
+            memset(dst, *src, length);
+        } else if (distance >= length) {
+            memcpy(dst, src, length);
+        } else {
+            for (int j = 0; j < length; j++) {
+                *dst++ = *src++;
+            }
+        }
+        
+        /* Return to caller to check if we should switch to slow path */
+        break;
+    }
+    
+    return (int64_t)(out_pos - start_pos);
+}
+
+/*
+ * SLOW PATH for Dynamic Huffman (btype 2)
+ * Full bounds checking on every write.
+ */
+static int64_t im_inflate_dynamic_slow(im_bitstream *bs, im_huffman_table *lit_table,
+                                        im_huffman_table *dist_table, uint8_t *output,
+                                        size_t out_pos, size_t output_size, int *done) {
+    size_t start_pos = out_pos;
+    *done = 0;
+    
+    while (1) {
+        bs_refill(bs);
+        
+        int sym1 = huff_decode_dynamic(bs, lit_table);
+        if (sym1 < 0) return -1;
+        
+        if (sym1 < 256) {
+            int sym2 = huff_decode_dynamic(bs, lit_table);
+            if (sym2 < 0) return -1;
+            
+            if (sym2 < 256) {
+                if (out_pos + 2 > output_size) return -1;
+                output[out_pos++] = (uint8_t)sym1;
+                output[out_pos++] = (uint8_t)sym2;
+                continue;
+            }
+            
+            if (out_pos >= output_size) return -1;
+            output[out_pos++] = (uint8_t)sym1;
+            sym1 = sym2;
+        }
+        
+        if (sym1 == 256) {
+            *done = 1;
+            break;
+        }
+        
+        int len_idx = sym1 - 257;
+        if (len_idx < 0 || len_idx >= 29) return -1;
+        
+        int length = im_length_base[len_idx];
+        if (im_length_extra[len_idx] > 0) {
+            length += bs_read(bs, im_length_extra[len_idx]);
+        }
+        
+        bs_refill(bs);
+        int dist_sym = huff_decode_dynamic(bs, dist_table);
+        if (dist_sym < 0 || dist_sym >= 30) return -1;
+        
+        int distance = im_distance_base[dist_sym];
+        if (im_distance_extra[dist_sym] > 0) {
+            distance += bs_read(bs, im_distance_extra[dist_sym]);
+        }
+        
+        if ((size_t)distance > out_pos) return -1;
+        if (out_pos + length > output_size) return -1;
+        
+        uint8_t *src = output + out_pos - distance;
+        uint8_t *dst = output + out_pos;
+        
+        if (distance == 1) {
+            memset(dst, *src, length);
+        } else if (distance >= length) {
+            memcpy(dst, src, length);
+        } else {
+            for (int j = 0; j < length; j++) {
+                *dst++ = *src++;
+            }
+        }
+        out_pos += length;
+    }
+    
+    return (int64_t)(out_pos - start_pos);
+}
+
+static int64_t im_inflate(const uint8_t *compressed, size_t comp_size, uint8_t *output, size_t output_size) {
+    im_bitstream bs;
+    bs_init(&bs, compressed, comp_size);
+    
+    size_t out_pos = 0;
+    int bfinal;
+    
+    do {
+        bfinal = bs_read(&bs, 1);
+        int btype = bs_read(&bs, 2);
+        
+        if (btype == 0) {
+            /* Uncompressed block */
+            bs_align(&bs);
+            uint16_t len = bs_read(&bs, 16);
+            uint16_t nlen = bs_read(&bs, 16);
+            
+            if ((len ^ nlen) != 0xFFFF) return -1;
+            
+            if (out_pos + len > output_size) return -1;
+            for (uint16_t i = 0; i < len; i++) {
+                output[out_pos++] = bs_read(&bs, 8);
+            }
+            
+        } else if (btype == 1) {
+            /*
+             * Fixed Huffman - use fast path when far from end,
+             * slow path when close to end.
+             */
+            int done = 0;
+            while (!done) {
+                int64_t written;
+                if (out_pos + INFLATE_FAST_MARGIN <= output_size) {
+                    /* FAST PATH: plenty of room, skip bounds checks */
+                    written = im_inflate_fixed_fast(&bs, output, out_pos, &done);
+                } else {
+                    /* SLOW PATH: near end, check every write */
+                    written = im_inflate_fixed_slow(&bs, output, out_pos, output_size, &done);
+                }
+                if (written < 0) return -1;
+                out_pos += written;
+            }
+            
+        } else if (btype == 2) {
+            /* Dynamic Huffman - parse code length tables first */
+            int hlit = bs_read(&bs, 5) + 257;
+            int hdist = bs_read(&bs, 5) + 1;
+            int hclen = bs_read(&bs, 4) + 4;
+            
+            static const int cl_order[19] = {
+                16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15
+            };
+            
+            uint8_t cl_lengths[19] = {0};
+            for (int i = 0; i < hclen; i++) {
+                cl_lengths[cl_order[i]] = bs_read(&bs, 3);
+            }
+            
+            im_huffman_table cl_table = {0};
+            im_build_huffman_table(&cl_table, cl_lengths, 19);
+            
+            uint8_t lengths[288 + 32] = {0};
+            int i = 0;
+            int total = hlit + hdist;
+            
+            while (i < total) {
+                bs_refill(&bs);
+                int sym = huff_decode_dynamic(&bs, &cl_table);
+                if (sym < 0) return -1;
+                
+                if (sym < 16) {
+                    lengths[i++] = sym;
+                } else if (sym == 16) {
+                    int repeat = bs_read(&bs, 2) + 3;
+                    uint8_t prev = (i > 0) ? lengths[i - 1] : 0;
+                    while (repeat-- > 0 && i < total) lengths[i++] = prev;
+                } else if (sym == 17) {
+                    int repeat = bs_read(&bs, 3) + 3;
+                    while (repeat-- > 0 && i < total) lengths[i++] = 0;
+                } else if (sym == 18) {
+                    int repeat = bs_read(&bs, 7) + 11;
+                    while (repeat-- > 0 && i < total) lengths[i++] = 0;
+                }
+            }
+            
+            im_huffman_table dyn_lit = {0};
+            im_huffman_table dyn_dist = {0};
+            im_build_huffman_table(&dyn_lit, lengths, hlit);
+            im_build_huffman_table(&dyn_dist, lengths + hlit, hdist);
+            
+            /* Main decode loop with fast/slow path switching */
+            int done = 0;
+            while (!done) {
+                int64_t written;
+                if (out_pos + INFLATE_FAST_MARGIN <= output_size) {
+                    /* FAST PATH: plenty of room */
+                    written = im_inflate_dynamic_fast(&bs, &dyn_lit, &dyn_dist,
+                                                       output, out_pos, &done);
+                } else {
+                    /* SLOW PATH: near end */
+                    written = im_inflate_dynamic_slow(&bs, &dyn_lit, &dyn_dist,
+                                                       output, out_pos, output_size, &done);
+                }
+                if (written < 0) return -1;
+                out_pos += written;
+            }
+            
+        } else {
+            return -1;  /* Invalid block type 3 */
+        }
+        
+    } while (!bfinal);
+    
+    return (int64_t)out_pos;
+}
+
+unsigned char *im_png_decompress(im_png_info *info, unsigned char *current_IDAT_chunk, int *idat_chunk_count) {
     uint32_t comp_data_size = 0;
     uint32_t tmp = 0;
+    unsigned char *start = current_IDAT_chunk;
 
-    char *start = current_IDAT_chunk;
-
-    /* find the total size of the compressed data */
-    while(*(uint32_t*)(current_IDAT_chunk + PNG_CHUNK_DATA_LEN) == CHUNK_IDAT) {
-
+    /* Find the total size of the compressed data */
+    while (*(uint32_t*)(current_IDAT_chunk + PNG_CHUNK_DATA_LEN) == CHUNK_IDAT) {
         im_memcpy(&tmp, current_IDAT_chunk, PNG_CHUNK_DATA_LEN);
         endian_swap(&tmp);
-        printf(" THE FUCKING DATA LENGTH: %d\n", tmp);
-
         comp_data_size += tmp;
         current_IDAT_chunk = im_png_peek_next_chunk(info, current_IDAT_chunk);
-        printf("TOTAL SIZE OF COMPRESSED DATA: %d\n", comp_data_size);
         (*idat_chunk_count)++;
     }
 
-    char *compressed_data = (char*)malloc(comp_data_size);
+    /* Allocate and concatenate IDAT data */
+    unsigned char *compressed_data = (unsigned char*)malloc(comp_data_size);
     if (!compressed_data) return NULL;
 
     size_t offset = 0;
     uint32_t current_chunk_data_len = 0;
-
-    /* concatenate the data sections of all the IDAT chunks together. */
-    /* we need to do this in order to decompress the data. */
     current_IDAT_chunk = start;
+    
     while (*(uint32_t*)(current_IDAT_chunk + 4) == CHUNK_IDAT) {
         im_memcpy(&current_chunk_data_len, current_IDAT_chunk, PNG_CHUNK_DATA_LEN);
         endian_swap(&current_chunk_data_len);
-
-        im_memcpy(compressed_data + offset, current_IDAT_chunk + PNG_CHUNK_DATA_LEN + PNG_CHUNK_TYPE_LEN, current_chunk_data_len);
+        im_memcpy(compressed_data + offset, 
+                  current_IDAT_chunk + PNG_CHUNK_DATA_LEN + PNG_CHUNK_TYPE_LEN, 
+                  current_chunk_data_len);
         offset += current_chunk_data_len;
-
-        current_IDAT_chunk += PNG_CHUNK_DATA_LEN + PNG_CHUNK_TYPE_LEN + current_chunk_data_len + PNG_CHUNK_CRC_LEN;
+        current_IDAT_chunk += PNG_CHUNK_DATA_LEN + PNG_CHUNK_TYPE_LEN + 
+                              current_chunk_data_len + PNG_CHUNK_CRC_LEN;
     }
 
-    /* this contains the compression method in the lower nibble, and the compression window size in the higher nibble. */
-    char *zlib_header = compressed_data;
-    compressed_data += 2; /* skip zlib header. */
-    uint8_t cmf = zlib_header[0];
-    uint8_t comp_method = cmf & 0x0F;   /* bits 0 - 3 | HAS TO BE 8 BECAUSE .PNG SPEC ONLY SUPPORTS DEFLATE. */
-    uint8_t window_size_bits  = (cmf >> 4) & 0x0F; /* bit 4 - 8 */
-    uint8_t window_size = 1 << (window_size_bits + 8); /* window = 1 << (8 + bits) | HAS to be 2^16 */
-
-    uint8_t flg = zlib_header[1];
-    uint8_t check_bits = flg & 0x1F;         /* bits 0-4 | Used for integrity check */
-    uint8_t preset_dict_flag = (flg >> 5) & 1;  /* bit 5 | HAS TO BE 0 BECAUSE .PNG SPEC SAID SO. */
-    uint8_t compression_level = (flg >> 6) & 3; /* bits 6-7 | 0 - 3 Compression level hints. These don't matter when decompressing. */
-
-    printf("Compression method: %d (should be 8 = DEFLATE)\n", comp_method);
-    printf("Compression window size: %d KB\n", window_size);
-    printf("check_bits: %d\n", check_bits);
-    printf("preset_dict_flag: %d\n", preset_dict_flag);
-    printf("Compression level: %d\n", compression_level);
-
-    printf("%lu\n", sizeof(cmf + flg));
-
-    if (((cmf << 8) + flg) % 31 == 0) {
-        printf("Info: Integrity check successful!\ndecompressing...\n");
-        size_t bytes_per_scanline = im_ceil(info->width * info->channel_count * info->bits_per_channel, 8);
-        size_t image_size_after_decompression = info->height * (bytes_per_scanline + 1); /* +1 per scanline for filter byte */
-        info->png_pixels = malloc(image_size_after_decompression);
-        struct {
-            uint8_t BFINAL;
-            uint8_t BTYPE;
-        }block_header;
-        size_t offset = 0;
-        im_bitsream bs = { (uint8_t*)compressed_data, 0 };
-        do {
-            block_header.BFINAL = consume_bits(&bs, 1);
-            block_header.BTYPE = consume_bits(&bs, 2);
-            printf("block_type %d, is_last_block %d\n", block_header.BTYPE, block_header.BFINAL);
-            switch(block_header.BTYPE) {
-                case UNCOMPRESSED: {
-                    IM_INFO("Copying uncompressed block!\n");
-                    align_next_byte(&bs);
-                    // since uncompressed data size can range between 0 and 65535 bytes,
-                    // len has to bigger than or equal to 0 and less than or equal to 65,535 bytes.
-                    uint16_t len  = consume_bits(&bs, 16);
-                    uint16_t nlen = consume_bits(&bs, 16);
-
-                    if ((len ^ nlen) != 0xFFFF) {
-                        IM_ERR("Corrupted block! Png is malformed. Not going to load png.\n");
-                        return NULL;
-                    }
-                    for (uint16_t i = 0; i < len; i++) {
-                        info->png_pixels[offset++] = (uint8_t)consume_bits(&bs, 8);
-                    }
-                    break;
-                }
-                case FIXED_HUFFMAN: {
-                    IM_INFO("Decompressing fixed huffman block!");
-                    im_png_build_fixed_huffman_tree();
-
-                    while (1) {
-                        int symbol = decode_fixed_literal_length(&bs);
-
-                        if (symbol < 0) {
-                            IM_ERR("Failed to decode symbol");
-                            break;
-                        }
-
-                        if (symbol < 256) {
-                            // Literal byte - copy to output
-                            info->png_pixels[offset++] = (uint8_t)symbol;
-                        } else if (symbol == 256) {
-                            // End of block
-                            break;
-                        } else if (symbol >= 257 && symbol <= 285) {
-                            // Length/distance pair
-                            int length_code = symbol - 257;
-                            int length = length_base[length_code];
-
-                            // Read extra length bits if needed
-                            if (length_extra[length_code] > 0) {
-                                length += consume_bits(&bs, length_extra[length_code]);
-                            }
-
-                            // Decode distance
-                            int dist_code = decode_fixed_distance(&bs);
-                            int distance = distance_base[dist_code];
-
-                            // Read extra distance bits if needed
-                            if (distance_extra[dist_code] > 0) {
-                                distance += consume_bits(&bs, distance_extra[dist_code]);
-                            }
-
-                            // Copy previous bytes
-                            for (int i = 0; i < length; i++) {
-                                info->png_pixels[offset] = info->png_pixels[offset - distance];
-                                offset++;
-                            }
-                        }
-                    }
-                    break;
-                }
-                case DYNAMIC_HUFFMAN: {
-                    IM_INFO("Decompressing dynamic huffman block!");
-                    
-                    uint16_t HLIT  = consume_bits(&bs, 5) + 257;  // # of literal/length codes
-                    uint16_t HDIST = consume_bits(&bs, 5) + 1;    // # of distance codes
-                    uint16_t HCLEN = consume_bits(&bs, 4) + 4;    // # of code length codes
-                    
-                    //printf("HLIT=%d, HDIST=%d, HCLEN=%d\n", HLIT, HDIST, HCLEN);
-                    
-                    static const int code_length_order[19] = {
-                        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15
-                    };
-                    
-                    uint8_t code_length_lengths[19] = {0};
-                    
-                    // Read code length code lengths
-                    for (int i = 0; i < HCLEN; i++) {
-                        code_length_lengths[code_length_order[i]] = consume_bits(&bs, 3);
-                    }
-                    
-                    // Build code length tree
-                    huffman_tree code_length_tree[19];
-                    build_huffman_tree(code_length_tree, code_length_lengths, 19);
-                    
-                    // Debug: print code length tree
-                    //printf("Code length tree:\n");
-                    for (int i = 0; i < 19; i++) {
-                        if (code_length_tree[i].len > 0) {
-                            //printf("  Symbol %d: len=%d, code=%d\n", i, code_length_tree[i].len, code_length_tree[i].code);
-                        }
-                    }
-                    
-                    // Decode literal/length and distance code lengths
-                    uint8_t *lengths = malloc((HLIT + HDIST) * sizeof(uint8_t));
-                    if (!lengths) {
-                        IM_ERR("Failed to allocate memory for code lengths");
-                        break;
-                    }
-                    im_memset(lengths, 0, HLIT + HDIST);
-                    
-                    int i = 0;
-                    while (i < HLIT + HDIST) {
-                        int symbol = decode_symbol(&bs, code_length_tree, 19);
-                        
-                        if (symbol < 0) {
-                            IM_ERR("Failed to decode code length symbol at position %d, bitpos=%zu", i, bs.bitpos);
-                            free(lengths);
-                            break;
-                        }
-                        
-                        //printf("Decoded symbol %d at position %d\n", symbol, i);
-                        
-                        if (symbol < 16) {
-                            // Literal length
-                            lengths[i++] = symbol;
-                        } else if (symbol == 16) {
-                            // Repeat previous code length 3-6 times
-                            if (i == 0) {
-                                IM_ERR("Cannot repeat previous code - no previous code exists");
-                                free(lengths);
-                                break;
-                            }
-                            int repeat = consume_bits(&bs, 2) + 3;
-                            uint8_t prev = lengths[i - 1];
-                            for (int j = 0; j < repeat && i < HLIT + HDIST; j++) {
-                                lengths[i++] = prev;
-                            }
-                        } else if (symbol == 17) {
-                            // Repeat 0 for 3-10 times
-                            int repeat = consume_bits(&bs, 3) + 3;
-                            for (int j = 0; j < repeat && i < HLIT + HDIST; j++) {
-                                lengths[i++] = 0;
-                            }
-                        } else if (symbol == 18) {
-                            // Repeat 0 for 11-138 times
-                            int repeat = consume_bits(&bs, 7) + 11;
-                            for (int j = 0; j < repeat && i < HLIT + HDIST; j++) {
-                                lengths[i++] = 0;
-                            }
-                        }
-                    }
-                    
-                    if (i < HLIT + HDIST) {
-                        IM_ERR("Failed to decode all code lengths (got %d, expected %d)", i, HLIT + HDIST);
-                        // lengths already freed above
-                        break;
-                    }
-                    
-                    // Build literal/length and distance trees
-                    huffman_tree *dyn_literal_tree = malloc(HLIT * sizeof(huffman_tree));
-                    huffman_tree *dyn_distance_tree = malloc(HDIST * sizeof(huffman_tree));
-                    
-                    if (!dyn_literal_tree || !dyn_distance_tree) {
-                        IM_ERR("Failed to allocate Huffman trees");
-                        if (dyn_literal_tree) free(dyn_literal_tree);
-                        if (dyn_distance_tree) free(dyn_distance_tree);
-                        free(lengths);
-                        break;
-                    }
-                    
-                    build_huffman_tree(dyn_literal_tree, lengths, HLIT);
-                    build_huffman_tree(dyn_distance_tree, lengths + HLIT, HDIST);
-                    
-                    // Decode compressed data
-                    while (1) {
-                        if (offset >= image_size_after_decompression) {
-                            IM_INFO("Reached end of output buffer");
-                            break;
-                        }
-                        
-                        int symbol = decode_symbol(&bs, dyn_literal_tree, HLIT);
-                        
-                        if (symbol < 0) {
-                            IM_ERR("Failed to decode symbol");
-                            break;
-                        }
-                        
-                        if (symbol < 256) {
-                            // Literal byte
-                            info->png_pixels[offset++] = (uint8_t)symbol;
-                        } else if (symbol == 256) {
-                            // End of block
-                            IM_INFO("End of block marker found");
-                            break;
-                        } else if (symbol >= 257 && symbol <= 285) {
-                            // Length/distance pair
-                            int length_code = symbol - 257;
-                            int length = length_base[length_code];
-                            
-                            if (length_extra[length_code] > 0) {
-                                length += consume_bits(&bs, length_extra[length_code]);
-                            }
-                            
-                            int dist_symbol = decode_symbol(&bs, dyn_distance_tree, HDIST);
-                            if (dist_symbol < 0 || dist_symbol >= 30) {
-                                IM_ERR("Invalid distance symbol: %d", dist_symbol);
-                                break;
-                            }
-                            
-                            int distance = distance_base[dist_symbol];
-                            
-                            if (distance_extra[dist_symbol] > 0) {
-                                distance += consume_bits(&bs, distance_extra[dist_symbol]);
-                            }
-                            
-                            if (distance > offset) {
-                                IM_ERR("Distance %d exceeds current offset %zu", distance, offset);
-                                break;
-                            }
-                            
-                            if (offset + length > image_size_after_decompression) {
-                                IM_ERR("Length/distance pair would overflow buffer");
-                                break;
-                            }
-                            
-                            // Copy previous bytes
-                            for (int i = 0; i < length; i++) {
-                                info->png_pixels[offset] = info->png_pixels[offset - distance];
-                                offset++;
-                            }
-                        }
-                    }
-                    
-                    free(dyn_literal_tree);
-                    free(dyn_distance_tree);
-                    free(lengths);
-                    break;
-                }
-                case RESERVED: {
-                    IM_ERR("Encountered reserved (invalid) block type!\n");
-                    break;
-                }
-            }
-        } while(!block_header.BFINAL);
-
-    } else {
-        fprintf(stderr, "Error: Integrity check failed.\n");
+    /* Parse zlib header */
+    uint8_t cmf = compressed_data[0];
+    uint8_t flg = compressed_data[1];
+    
+    if (((cmf << 8) + flg) % 31 != 0) {
+        free(compressed_data);
+        IM_ERR( "Error: zlib integrity check failed.");
+        return NULL;
+    }
+    
+    uint8_t comp_method = cmf & 0x0F;
+    if (comp_method != 8) {
+        free(compressed_data);
+        IM_ERR("Error: unsupported compression method %d", comp_method);
+        return NULL;
     }
 
+    /* Calculate output size */
+    size_t bytes_per_scanline = (info->width * info->channel_count * info->bits_per_channel + 7) / 8;
+    size_t output_size = info->height * (bytes_per_scanline + 1);  /* +1 for filter byte */
+    
+    info->png_pixels = malloc(output_size);
+    if (!info->png_pixels) {
+        free(compressed_data);
+        return NULL;
+    }
+
+    /* Decompress (skip 2-byte zlib header) */
+    int64_t result = im_inflate(compressed_data + 2, comp_data_size - 2,
+                                info->png_pixels, output_size);
+    
+    free(compressed_data);
+    
+    if (result < 0) {
+        free(info->png_pixels);
+        info->png_pixels = NULL;
+        return NULL;
+    }
+
+    /* Unfilter the image data */
     im_png_unfilter(info);
+    
     return info->png_pixels;
 }
 
-unsigned char *im_png_load(char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
+unsigned char *im_png_load(unsigned char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
 
     im_png_info info = {0};
     info.first_ihdr = im_true;
@@ -1316,28 +2019,31 @@ unsigned char *im_png_load(char *image_file, size_t file_size, int *width, int *
     info.at = image_file;
 
     info.end_of_file = image_file + file_size;
-    char *png_sig = (char*)consume(&info.at, info.end_of_file, sizeof(png_sig));
-    im_png_print_bytes(png_sig, PNG_SIG_LEN);
+    unsigned char *png_sig = (unsigned char*)consume(&info.at, info.end_of_file, sizeof(png_sig));
 
-    char *next_chunk_type = NULL;
+#ifdef IM_DEBUG
+    im_print_bytes(png_sig, PNG_SIG_LEN);
+#endif
+
+    unsigned char *next_chunk_type = NULL;
     next_chunk_type = get_next_chunk_type(&info);
     if(!next_chunk_type) return NULL;
 
     while(*(uint32_t*)next_chunk_type != CHUNK_IEND) {
         next_chunk_type = get_next_chunk_type(&info);
         if(!next_chunk_type) return NULL;
-        printf("chunk: %.*s\n", 4, next_chunk_type);
+        IM_INFO("chunk: %.*s", 4, next_chunk_type);
         switch(*(uint32_t*)next_chunk_type)  {
             case CHUNK_IHDR:
                 im_png_parse_chunk_IHDR(&info);
                 *width = info.width;
                 *height = info.height;
                 *num_channels = info.channel_count;
-                printf("-----------------------------\n");
+                IM_INFO("-----------------------------");
                 break;
             case CHUNK_cHRM:
                 im_png_parse_chunk_cHRM(&info);
-                printf("-----------------------------\n");
+                IM_INFO("-----------------------------");
                 break;
             case CHUNK_iCCP:
                 skip_chunk(&info);
@@ -1353,7 +2059,7 @@ unsigned char *im_png_load(char *image_file, size_t file_size, int *width, int *
                 break;
             case CHUNK_bKGD:
                 im_png_parse_chunk_bKGD(&info);
-                printf("-----------------------------\n");
+                IM_INFO("-----------------------------");
                 break;
             case CHUNK_hIST:
                 skip_chunk(&info);
@@ -1368,13 +2074,13 @@ unsigned char *im_png_load(char *image_file, size_t file_size, int *width, int *
                 skip_chunk(&info);
                 break;
             case CHUNK_IDAT: {
-                size_t idat_chunk_count = 0;
-                char *err = im_png_decompress(&info, next_chunk_type - PNG_CHUNK_DATA_LEN, &idat_chunk_count);
+                int idat_chunk_count = 0;
+                unsigned char *err = im_png_decompress(&info, next_chunk_type - PNG_CHUNK_DATA_LEN, &idat_chunk_count);
                 if(!err) return NULL;
                 for(int i = 0; i < idat_chunk_count; i++) {
                     skip_chunk(&info);
                 }
-                printf("-----------------------------\n");
+                IM_INFO("-----------------------------");
                 break;
             }
             case CHUNK_iTXt:
@@ -1382,22 +2088,22 @@ unsigned char *im_png_load(char *image_file, size_t file_size, int *width, int *
                 break;
             case CHUNK_tEXt:
                 im_png_parse_chunk_tEXt(&info);
-                printf("-----------------------------\n");
+                IM_INFO("-----------------------------");
                 break;
             case CHUNK_zTXt:
                 skip_chunk(&info);
                 break;
             case CHUNK_tIME:
                 im_png_parse_chunk_tIME(&info);
-                printf("-----------------------------\n");
+                IM_INFO("-----------------------------");
                 break;
             case CHUNK_gAMA:
                 im_png_parse_chunk_gAMA(&info);
-                printf("-----------------------------\n");
+                IM_INFO("-----------------------------");
                 break;
             case CHUNK_IEND:
                 im_png_parse_chunk_IEND(&info);
-                printf("-----------------------------\n");
+                IM_INFO("-----------------------------");
                 break;
             default:
                 skip_chunk(&info);
@@ -1407,36 +2113,36 @@ unsigned char *im_png_load(char *image_file, size_t file_size, int *width, int *
     return info.png_pixels;
 }
 
-static char consume_byte(char **at, char *end_of_file) {
-    char *orig = *at;
+static unsigned char consume_byte(unsigned char **at, unsigned char *end_of_file) {
+    unsigned char *orig = *at;
     if(*at < end_of_file) {
         *at += 1;
         return *orig;
     }
-    fprintf(stderr, "Error: %s(), will not read past end of file.\n", __func__);
+    IM_ERR("Error: %s(), will not read past end of file.", __func__);
     return 0;  // Return 0 on error, which will stop the while loop
 }
 
 /* peeks the current byte without consuming it */
-static char peek_byte(char *current_pos, char *end_of_file) {
-    if (current_pos < end_of_file) {
-        return *current_pos;
+static unsigned char peek_byte(unsigned char *at, unsigned char *end_of_file) {
+    if (at < end_of_file) {
+        return *at;
     }
-    fprintf(stderr, "Error: %s(), will not peek past end of file.", __func__);
-    return *current_pos;
+    IM_ERR("Error: %s(), will not peek past end of file.", __func__);
+    return *at;
 }
 
-im_bool is_end_of_line(char ch) {
+im_bool is_end_of_line(unsigned char ch) {
     return ch == '\n' || ch == '\r';
 }
 
-char *im_parse_pnm_ascii_header(char *at, char *end_of_file, int *width, int *height) {
+unsigned char *im_parse_pnm_ascii_header(unsigned char *at, unsigned char *end_of_file, int *width, int *height) {
 
     /* skip sig */
-    char *sig = consume(&at, end_of_file, 2);
+    consume(&at, end_of_file, 2);
 
     /* eat whitespaces after sig */
-    char c = 0;
+    unsigned char c = 0;
     while ((c = peek_byte(at, end_of_file)) && (c == ' ' || c == '\n' || c == '\r' || c == '\t')) {
         consume_byte(&at, end_of_file);
     }
@@ -1445,7 +2151,7 @@ char *im_parse_pnm_ascii_header(char *at, char *end_of_file, int *width, int *he
 
     while(*at == '#') {
         if(peek_byte(at, end_of_file) == '#') {
-            char byte = 0;
+            unsigned char byte = 0;
             do{
                 byte = consume_byte(&at, end_of_file);
             }while(!is_end_of_line(byte));
@@ -1513,9 +2219,9 @@ char *im_parse_pnm_ascii_header(char *at, char *end_of_file, int *width, int *he
     return at;
 }
 
-unsigned char *im_p1_load(char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
-    char *at = image_file;
-    char *end_of_file = image_file + file_size;
+unsigned char *im_p1_load(unsigned char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
+    unsigned char *at = image_file;
+    unsigned char *end_of_file = image_file + file_size;
     unsigned char *pixels = NULL;
     unsigned char *pixel_write_pos = NULL;
     size_t pixels_written = 0;
@@ -1531,7 +2237,7 @@ unsigned char *im_p1_load(char *image_file, size_t file_size, int *width, int *h
     if (!pixels) return NULL;
     pixel_write_pos = pixels;
     pixels_written = 0;
-    char c = 0;
+    unsigned char c = 0;
 
     while((c = consume_byte(&at, end_of_file)) && pixels_written < pixel_count) {
         if (c == '0') {
@@ -1547,9 +2253,9 @@ unsigned char *im_p1_load(char *image_file, size_t file_size, int *width, int *h
     return pixels;
 }
 
-int get_max_val(char **at, char *end_of_file) {
+int get_max_val(unsigned char **at, unsigned char *end_of_file) {
     int max_val = 0;
-    char c = peek_byte(*at, end_of_file);
+    unsigned char c = peek_byte(*at, end_of_file);
 
     if (c >= '0' && c <= '9') {
         while ((c = peek_byte(*at, end_of_file)) >= '0' && c <= '9') {
@@ -1562,9 +2268,9 @@ int get_max_val(char **at, char *end_of_file) {
     return -1; // Error: no valid number found
 }
 
-unsigned char *im_p2_load(char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
-    char *at = image_file;
-    char *end_of_file = image_file + file_size;
+unsigned char *im_p2_load(unsigned char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
+    unsigned char *at = image_file;
+    unsigned char *end_of_file = image_file + file_size;
     unsigned char *pixels = NULL;
     *num_channels = 1;
     *width = 0;
@@ -1579,7 +2285,7 @@ unsigned char *im_p2_load(char *image_file, size_t file_size, int *width, int *h
     float multiplication_factor = 255.0f / (float)max_val;
 
     /* skip white space after the max val */
-    char c;
+    unsigned char c;
     while ((c = peek_byte(at, end_of_file)) && (c == ' ' || c == '\n' || c == '\r' || c == '\t')) {
         consume_byte(&at, end_of_file);
     }
@@ -1609,9 +2315,9 @@ unsigned char *im_p2_load(char *image_file, size_t file_size, int *width, int *h
     return pixels;
 }
 
-unsigned char *im_p3_load(char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
-    char *at = image_file;
-    char *end_of_file = image_file + file_size;
+unsigned char *im_p3_load(unsigned char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
+    unsigned char *at = image_file;
+    unsigned char *end_of_file = image_file + file_size;
     unsigned char *pixels = NULL;
     *num_channels = 3;
     *width = 0;
@@ -1626,7 +2332,7 @@ unsigned char *im_p3_load(char *image_file, size_t file_size, int *width, int *h
     float multiplication_factor = 255.0f / (float)max_val;
 
     /* skip white space after the max val */
-    char c;
+    unsigned char c;
     while ((c = peek_byte(at, end_of_file)) && (c == ' ' || c == '\n' || c == '\r' || c == '\t')) {
         consume_byte(&at, end_of_file);
     }
@@ -1658,9 +2364,9 @@ unsigned char *im_p3_load(char *image_file, size_t file_size, int *width, int *h
     return pixels;
 }
 
-unsigned char *im_p4_load(char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
-    char *at = image_file;
-    char *end_of_file = image_file + file_size;
+unsigned char *im_p4_load(unsigned char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
+    unsigned char *at = image_file;
+    unsigned char *end_of_file = image_file + file_size;
     unsigned char *pixels = NULL;
     *num_channels = 1;
     *width = 0;
@@ -1693,9 +2399,9 @@ unsigned char *im_p4_load(char *image_file, size_t file_size, int *width, int *h
     return pixels;
 }
 
-unsigned char *im_p5_load(char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
-    char *at = image_file;
-    char *end_of_file = image_file + file_size;
+unsigned char *im_p5_load(unsigned char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
+    unsigned char *at = image_file;
+    unsigned char *end_of_file = image_file + file_size;
     unsigned char *pixels = NULL;
     *num_channels = 1;
     *width = 0;
@@ -1710,7 +2416,7 @@ unsigned char *im_p5_load(char *image_file, size_t file_size, int *width, int *h
     float multiplication_factor = 255.0f / (float)max_val;
 
     /* skip single whitespace character after max val (usually newline) */
-    char c = peek_byte(at, end_of_file);
+    unsigned char c = peek_byte(at, end_of_file);
     if (c == ' ' || c == '\n' || c == '\r' || c == '\t') {
         consume_byte(&at, end_of_file);
     }
@@ -1739,9 +2445,9 @@ unsigned char *im_p5_load(char *image_file, size_t file_size, int *width, int *h
     return pixels;
 }
 
-unsigned char *im_p6_load(char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
-    char *at = image_file;
-    char *end_of_file = image_file + file_size;
+unsigned char *im_p6_load(unsigned char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
+    unsigned char *at = image_file;
+    unsigned char *end_of_file = image_file + file_size;
     unsigned char *pixels = NULL;
     *num_channels = 3;
     *width = 0;
@@ -1756,7 +2462,7 @@ unsigned char *im_p6_load(char *image_file, size_t file_size, int *width, int *h
     float multiplication_factor = 255.0f / (float)max_val;
 
     /* skip single whitespace character after max val (usually newline) */
-    char c = peek_byte(at, end_of_file);
+    unsigned char c = peek_byte(at, end_of_file);
     if (c == ' ' || c == '\n' || c == '\r' || c == '\t') {
         consume_byte(&at, end_of_file);
     }
@@ -1784,14 +2490,6 @@ unsigned char *im_p6_load(char *image_file, size_t file_size, int *width, int *h
 
     return pixels;
 }
-
-unsigned char *im_psd_load(char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
-    char *at = image_file;
-    char *end_of_file = image_file + file_size;
-    char *sig = consume(&at, end_of_file, 4);
-    printf("psd_sig: %.*s\n", 4, sig);
-}
-
 
 typedef struct color_coords {
   int32_t x;
@@ -2063,6 +2761,7 @@ unsigned char *im_bmp_copy_data(unsigned char *pixel_offset, int width, int heig
                 src += 12;
                 dst += 12;
             }
+            /* handle the leftovers without unrolling */
             for (; x < width; x++) {
                 dst[0] = src[2]; dst[1] = src[1]; dst[2] = src[0];
                 src += 3;
@@ -2095,7 +2794,7 @@ unsigned char *im_bmp_copy_data(unsigned char *pixel_offset, int width, int heig
                 src += 16;
                 dst += 16;
             }
-            /* leftovers */
+            /* handle the leftovers scalar */
             for (; x < width; x++) {
                 dst[0] = src[2];
                 dst[1] = src[1];
@@ -2112,16 +2811,16 @@ unsigned char *im_bmp_copy_data(unsigned char *pixel_offset, int width, int heig
     return output;
 }
 
-unsigned char *im_bmp_load(char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
-    char *at = image_file;
-    char *end_of_file = image_file + file_size;
+unsigned char *im_bmp_load(unsigned char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
+    unsigned char *at = image_file;
+    unsigned char *end_of_file = image_file + file_size;
 
     bitmap_file_header file_header;
-    file_header.type        = *(uint16_t*)consume(&at, end_of_file, sizeof(uint16_t));
-    file_header.size        = *(uint32_t*)consume(&at, end_of_file, sizeof(uint32_t));
-    file_header.reserved1   = *(uint16_t*)consume(&at, end_of_file, sizeof(uint16_t));
-    file_header.reserved2   = *(uint16_t*)consume(&at, end_of_file, sizeof(uint16_t));
-    file_header.bitmap_offset = *(uint32_t*)consume(&at, end_of_file, sizeof(uint32_t));
+    file_header.type        = consume_uint16(&at, end_of_file);
+    file_header.size        = consume_uint32(&at, end_of_file);
+    file_header.reserved1   = consume_uint16(&at, end_of_file);
+    file_header.reserved2   = consume_uint16(&at, end_of_file);
+    file_header.bitmap_offset = consume_uint32(&at, end_of_file);
 
     unsigned char *pixel_offset = (unsigned char *)image_file + file_header.bitmap_offset;
 
@@ -2129,6 +2828,7 @@ unsigned char *im_bmp_load(char *image_file, size_t file_size, int *width, int *
     size_t bits_per_pixel = 0;
     uint8_t rgb_palette[256*3] = {0};
     int palette_entries = 0;
+    uint32_t compression_format = 0;
 
     switch(*dib_header_size) {
 
@@ -2157,7 +2857,7 @@ unsigned char *im_bmp_load(char *image_file, size_t file_size, int *width, int *
             bits_per_pixel = header.bit_count;
 
             if(bits_per_pixel <= 8) {
-                palette_entries = 1 << bits_per_pixel;
+                palette_entries = 1u << bits_per_pixel;
                 unsigned char *bmp_palette = (unsigned char*)at;
                 for(int i = 0; i < palette_entries; i++) {
                     rgb_palette[i*3 + 0] = bmp_palette[i*4 + 2];
@@ -2173,9 +2873,10 @@ unsigned char *im_bmp_load(char *image_file, size_t file_size, int *width, int *
             *width = header.width;
             *height = header.height;
             bits_per_pixel = header.bit_count;
+            compression_format = header.compression_format;
 
             if(bits_per_pixel <= 8) {
-                palette_entries = header.num_color_indices ? header.num_color_indices : 1 << bits_per_pixel;
+                palette_entries = header.num_color_indices ? header.num_color_indices : 1u << bits_per_pixel;
                 unsigned char *bmp_palette = (unsigned char*)at;
                 for(int i = 0; i < palette_entries; i++) {
                     rgb_palette[i*3 + 0] = bmp_palette[i*4 + 2];
@@ -2191,9 +2892,10 @@ unsigned char *im_bmp_load(char *image_file, size_t file_size, int *width, int *
             *width = header.width;
             *height = header.height;
             bits_per_pixel = header.bit_count;
+            compression_format = header.compression_format;
 
             if(bits_per_pixel <= 8) {
-                palette_entries = header.num_color_indices ? header.num_color_indices : 1 << bits_per_pixel;
+                palette_entries = header.num_color_indices ? header.num_color_indices : 1u << bits_per_pixel;
                 unsigned char *bmp_palette = (unsigned char*)at;
                 for(int i = 0; i < palette_entries; i++) {
                     rgb_palette[i*3 + 0] = bmp_palette[i*4 + 2];
@@ -2209,9 +2911,10 @@ unsigned char *im_bmp_load(char *image_file, size_t file_size, int *width, int *
             *width = header.width;
             *height = header.height;
             bits_per_pixel = header.bit_count;
+            compression_format = header.compression_format;
 
             if(bits_per_pixel <= 8) {
-                palette_entries = header.num_color_indices ? header.num_color_indices : 1 << bits_per_pixel;
+                palette_entries = header.num_color_indices ? header.num_color_indices : 1u << bits_per_pixel;
                 unsigned char *bmp_palette = (unsigned char*)at;
                 for(int i = 0; i < palette_entries; i++) {
                     rgb_palette[i*3 + 0] = bmp_palette[i*4 + 2];
@@ -2227,9 +2930,10 @@ unsigned char *im_bmp_load(char *image_file, size_t file_size, int *width, int *
             *width = header.width;
             *height = header.height;
             bits_per_pixel = header.bit_count;
+            compression_format = header.compression_format;
 
             if(bits_per_pixel <= 8) {
-                palette_entries = header.num_color_indices ? header.num_color_indices : 1 << bits_per_pixel;
+                palette_entries = header.num_color_indices ? header.num_color_indices : 1u << bits_per_pixel;
                 unsigned char *bmp_palette = (unsigned char*)at;
                 for(int i = 0; i < palette_entries; i++) {
                     rgb_palette[i*3 + 0] = bmp_palette[i*4 + 2];
@@ -2245,9 +2949,10 @@ unsigned char *im_bmp_load(char *image_file, size_t file_size, int *width, int *
             *width = header.width;
             *height = header.height;
             bits_per_pixel = header.bit_count;
+            compression_format = header.compression_format;
 
             if(bits_per_pixel <= 8) {
-                palette_entries = header.num_color_indices ? header.num_color_indices : 1 << bits_per_pixel;
+                palette_entries = header.num_color_indices ? header.num_color_indices : 1u << bits_per_pixel;
                 unsigned char *bmp_palette = (unsigned char*)at;
                 for(int i = 0; i < palette_entries; i++) {
                     rgb_palette[i*3 + 0] = bmp_palette[i*4 + 2];
@@ -2263,9 +2968,10 @@ unsigned char *im_bmp_load(char *image_file, size_t file_size, int *width, int *
             *width = header.width;
             *height = header.height;
             bits_per_pixel = header.bit_count;
+            compression_format = header.compression_format;
 
             if(bits_per_pixel <= 8) {
-                palette_entries = header.num_color_indices ? header.num_color_indices : 1 << bits_per_pixel;
+                palette_entries = header.num_color_indices ? header.num_color_indices : 1u << bits_per_pixel;
                 unsigned char *bmp_palette = (unsigned char*)at;
                 for(int i = 0; i < palette_entries; i++) {
                     rgb_palette[i*3 + 0] = bmp_palette[i*4 + 2];
@@ -2281,27 +2987,35 @@ unsigned char *im_bmp_load(char *image_file, size_t file_size, int *width, int *
             return NULL;
     }
 
-    return im_bmp_copy_data(pixel_offset, *width, *height, bits_per_pixel, 0, (bits_per_pixel <= 8) ? rgb_palette : NULL);
+    return im_bmp_copy_data(pixel_offset, *width, *height, bits_per_pixel, compression_format, (bits_per_pixel <= 8) ? rgb_palette : NULL);
 }
+
+unsigned char *im_psd_load(unsigned char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
+    unsigned char *at = image_file;
+    unsigned char *end_of_file = image_file + file_size;
+    unsigned char *sig = (unsigned char*)consume(&at, end_of_file, 4);
+    IM_INFO("psd_sig: %.*s\n", 4, sig);
+}
+
 
 IM_API unsigned char *im_load(const char *image_path, int *width, int *height, int *number_of_channels, int desired_channels) {
 
     size_t file_size = 0;
-    char *image_file = im__read_entire_file(image_path, &file_size);
+    unsigned char *image_file = im__read_entire_file(image_path, &file_size);
 
     if(!image_file) {
-        fprintf(stderr, "ERROR: Failed to read image file from disk.\n");
+        IM_ERR("ERROR: Failed to read image file from disk.");
         return NULL;
     }
 
     if(!file_size) {
-        fprintf(stderr, "ERROR: size of image file is 0.\n");
+        IM_ERR("ERROR: size of image file is 0.");
         return NULL;
     }
 
     uint8_t file_sig[8] = {0};
-    char *at = image_file;
-    char *end_of_file = image_file + file_size;
+    unsigned char *at = image_file;
+    unsigned char *end_of_file = image_file + file_size;
 
     for(int i = 0; i < 8; i++) {
         if(at < end_of_file) {
@@ -2310,6 +3024,8 @@ IM_API unsigned char *im_load(const char *image_path, int *width, int *height, i
             break;
         }
     }
+
+    im_detect_cpu_features();
 
     if(im_memcmp(im_png_sig, file_sig, PNG_SIG_LEN) == 0) {
         return im_png_load(image_file, file_size, width, height, number_of_channels, desired_channels);
@@ -2333,7 +3049,7 @@ IM_API unsigned char *im_load(const char *image_path, int *width, int *height, i
         return NULL;
     }
 
-    fprintf(stderr, "ERROR: File signature does not match any known image formats.\n");
+    IM_ERR("ERROR: File signature does not match any known image formats.\n");
     return NULL;
 }
 

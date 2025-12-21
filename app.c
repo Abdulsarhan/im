@@ -16,15 +16,20 @@ int main(int argc, char **argv) {
     char *file_path = argv[1];
 
     int image_width, image_height, nr_channels;
-    unsigned char *image = im_load(file_path, &image_width, &image_height, &nr_channels, 0);
-    if(!image) return 0;
 
+    unsigned char *image = im_load(file_path, &image_width, &image_height, &nr_channels, 0);
+    exit(0);
     pal_init();
     int window_width = 800, window_height = 600;
-    pal_window *window = pal_create_window(window_width, window_height, "image_viewer", 0);
+    pal_window *window = pal_create_window(window_width, window_height, "image_viewer", PAL_WINDOW_RESIZABLE);
+    if(!image){
+        printf("no image!\n");
+        return 0;
+    }
+
     int running = 1;
     pal_event event;
-    pal_vec4 bg_color = {1.0f, 1.0f, 1.0f, 1.0f};
+    pal_color bg_color = { 255, 255, 255, 255 };
 
     while(running) {
         while(pal_poll_events(&event)) {
@@ -56,28 +61,39 @@ int main(int argc, char **argv) {
                 pal_draw_rect(window, x + 400, y + 300, 1, 1, color);
 
 #endif
+#if 0
                 pal_color color;
                 color.r = image[img_pixel_idx++];
                 color.g = image[img_pixel_idx++];
                 color.b = image[img_pixel_idx++];
                 color.a =  255.0f;
                 pal_draw_rect(window, x + window_width / 2, y + window_height / 2, 1, 1, color);
-#if 0
-                /* PNG_TEST */
-                float src_r = (float)image[img_pixel_idx++] / 255.0f;
-                float src_g = (float)image[img_pixel_idx++] / 255.0f;
-                float src_b = (float)image[img_pixel_idx++] / 255.0f;
-                float src_a = (float)image[img_pixel_idx++] / 255.0f;
-                
-                // Alpha blend with background
-                pal_vec4 color;
-                color.r = src_r * src_a + bg_color.r * (1.0f - src_a);
-                color.g = src_g * src_a + bg_color.g * (1.0f - src_a);
-                color.b = src_b * src_a + bg_color.b * (1.0f - src_a);
-                color.a = 1.0f; // Fully opaque after blending
-                
-                pal_draw_rect(window, x + window_width / 2, y + window_height / 2, 1, 1, color);
 #endif
+
+                /* PNG_TEST */
+                /* PNG_TEST — manual alpha blending, uint8_t pal_color */
+
+                uint8_t src_r = image[img_pixel_idx++];
+                uint8_t src_g = image[img_pixel_idx++];
+                uint8_t src_b = image[img_pixel_idx++];
+                uint8_t src_a = image[img_pixel_idx++];  // 0–255
+
+                float a = src_a / 255.0f;
+
+                pal_color color;
+                color.r = (uint8_t)(src_r * a + bg_color.r * (1.0f - a));
+                color.g = (uint8_t)(src_g * a + bg_color.g * (1.0f - a));
+                color.b = (uint8_t)(src_b * a + bg_color.b * (1.0f - a));
+                color.a = 255;  // fully opaque after blending
+
+                pal_draw_rect(
+                    window,
+                    x + window_width / 2,
+                    y + window_height / 2,
+                    1,
+                    1,
+                    color
+                );
             }
         }
     }
