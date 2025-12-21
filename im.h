@@ -196,8 +196,8 @@ typedef enum {
 
 typedef struct{
     unsigned char *png_file;
-    unsigned char *at; // newer variable used for parsing
-    unsigned char *end_of_file; // we use at + end of file to figure out where we are, and where the end is so that we don't go over.
+    unsigned char *at; /* newer variable used for parsing */
+    unsigned char *end_of_file; /* we use at + end of file to figure out where we are, and where the end is so that we don't go over. */
     uint32_t width;
     uint32_t height;
     uint8_t channel_count; /* channels are called "samples" in the spec, but that's stupid, so I won't call them samples. */
@@ -833,6 +833,18 @@ uint16_t consume_and_swap_uint16(unsigned char **at, unsigned char *end_of_file)
     return value;
 }
 
+uint16_t endian_swap_uint16(uint16_t *start) {
+    uint32_t value = *start;
+    value = value << 8 | value >> 8;
+    return value;
+}
+
+uint32_t endian_swap_uint32(uint32_t *start) {
+    uint32_t value = *start;
+    value = (value << 24) | ((value << 8) & 0x00FF0000) | ((value >> 8) & 0x0000FF00) | (value >> 24);
+    return value;
+}
+
 void endian_swap(uint32_t *start) {
     uint32_t value = *start;
     value = (value << 24) | ((value << 8) & 0x00FF0000) | ((value >> 8) & 0x0000FF00) | (value >> 24);
@@ -888,7 +900,7 @@ void im_png_parse_chunk_IHDR(im_png_info *info) {
     info->filter_method = consume_uint8(&info->at, info->end_of_file);
     info->interlace_method = consume_uint8(&info->at, info->end_of_file);
 
-    uint32_t crc = consume_uint32(&info->at, info->end_of_file);
+    consume_uint32(&info->at, info->end_of_file);
 
 #ifndef IM_NO_ERRORS
     if(info->color_type == 1 || info->color_type > 6) {
@@ -958,7 +970,7 @@ void im_png_parse_chunk_IHDR(im_png_info *info) {
     info->gamma = tmp / 100000.0;
     IM_INFO("gAMA chunk: gamma = %.5f\n", info->gamma);
 
-    uint32_t crc = consume_uint32(&info->at, info->end_of_file);
+    consume_uint32(&info->at, info->end_of_file);
 }
 
 void im_png_parse_chunk_cHRM(im_png_info *info) {
@@ -995,7 +1007,7 @@ void im_png_parse_chunk_cHRM(im_png_info *info) {
     IM_INFO("blue_x = %.5f\n", info->blue_x);
     IM_INFO("blue_y = %.5f\n", info->blue_y);
 
-    uint32_t crc = consume_uint32(&info->at, info->end_of_file);
+    consume_uint32(&info->at, info->end_of_file);
 }
 
 void im_png_parse_chunk_bKGD(im_png_info *info) {
@@ -1036,7 +1048,7 @@ void im_png_parse_chunk_bKGD(im_png_info *info) {
         }
     }
 
-    uint32_t crc = consume_uint32(&info->at, info->end_of_file);
+    consume_uint32(&info->at, info->end_of_file);
 }
 
 void im_png_parse_chunk_tIME(im_png_info *info) {
@@ -1054,7 +1066,7 @@ void im_png_parse_chunk_tIME(im_png_info *info) {
     info->minute = consume_uint8(&info->at, info->end_of_file);
     info->second = consume_uint8(&info->at, info->end_of_file);
 
-    uint32_t crc = consume_uint32(&info->at, info->end_of_file);
+    consume_uint32(&info->at, info->end_of_file);
 }
 
 void im_png_parse_chunk_tEXt(im_png_info *info) {
@@ -1076,7 +1088,7 @@ void im_png_parse_chunk_tEXt(im_png_info *info) {
 
     IM_INFO("%s %.*s\n", keyword, (int)text_len, text);
 
-    uint32_t crc = consume_uint32(&info->at, info->end_of_file);
+    consume_uint32(&info->at, info->end_of_file);
 }
 
 void im_png_parse_chunk_IEND(im_png_info *info) {
@@ -1087,7 +1099,7 @@ void im_png_parse_chunk_IEND(im_png_info *info) {
         IM_ERR("Length section of IEND chunk is not 0.");
     }
 
-    uint32_t crc = consume_uint32(&info->at, info->end_of_file);
+    consume_uint32(&info->at, info->end_of_file);
 }
 
 unsigned char *get_next_chunk_type(im_png_info *info) {
@@ -2744,14 +2756,635 @@ unsigned char *im_bmp_load(unsigned char *image_file, size_t file_size, int *wid
 
     return im_bmp_copy_data(pixel_offset, *width, *height, bits_per_pixel, compression_format, (bits_per_pixel <= 8) ? rgb_palette : NULL);
 }
+/*
+ * Complete PSD loader implementation
+ * Replace the existing im_psd_load function with this code
+ */
+
+typedef enum {
+    IM_PSD_COMP_RAW = 0,
+    IM_PSD_COMP_RLE = 1,
+    IM_PSD_COMP_ZIP_NO_PREDICTION = 2,
+    IM_PSD_COMP_ZIP_WITH_PREDICTION = 3,
+} im_psd_compression_types;
+
+typedef enum {
+    IM_PSD_COLOR_BITMAP = 0,
+    IM_PSD_COLOR_GRAYSCALE = 1,
+    IM_PSD_COLOR_INDEXED = 2,
+    IM_PSD_COLOR_RGB = 3,
+    IM_PSD_COLOR_CMYK = 4,
+    IM_PSD_COLOR_MULTICHANNEL = 7,
+    IM_PSD_COLOR_DUOTONE = 8,
+    IM_PSD_COLOR_LAB = 9,
+} IM_PSD_COLOR_modes;
+
+/* PackBits RLE decompression for PSD files */
+static int im_psd_decode_rle_row(unsigned char *dst, size_t dst_len, unsigned char **src, unsigned char *src_end) {
+    size_t written = 0;
+    
+    while (written < dst_len && *src < src_end) {
+        int8_t header = (int8_t)(*(*src)++);
+        
+        if (header >= 0) {
+            /* Literal run: copy (header + 1) bytes */
+            int count = header + 1;
+            for (int i = 0; i < count && written < dst_len && *src < src_end; i++) {
+                dst[written++] = *(*src)++;
+            }
+        } else if (header != -128) {
+            /* Repeat run: repeat next byte (1 - header) times */
+            int count = 1 - header;
+            if (*src >= src_end) break;
+            unsigned char value = *(*src)++;
+            for (int i = 0; i < count && written < dst_len; i++) {
+                dst[written++] = value;
+            }
+        }
+        /* header == -128 is a no-op */
+    }
+    
+    return (written == dst_len) ? 0 : -1;
+}
+
+/* Convert planar channel data to interleaved RGB(A) */
+static void im_psd_interleave_channels_8bit(unsigned char *output, 
+                                             unsigned char **channels,
+                                             int channel_count,
+                                             size_t pixel_count) {
+    for (size_t i = 0; i < pixel_count; i++) {
+        for (int c = 0; c < channel_count; c++) {
+            output[i * channel_count + c] = channels[c][i];
+        }
+    }
+}
+
+/* Convert 16-bit big-endian planar to 8-bit interleaved */
+static void im_psd_interleave_channels_16bit(unsigned char *output,
+                                              unsigned char **channels,
+                                              int channel_count,
+                                              size_t pixel_count) {
+    for (size_t i = 0; i < pixel_count; i++) {
+        for (int c = 0; c < channel_count; c++) {
+            /* 16-bit samples are big-endian, take high byte for 8-bit output */
+            uint16_t val = (channels[c][i * 2] << 8) | channels[c][i * 2 + 1];
+            output[i * channel_count + c] = (unsigned char)(val >> 8);
+        }
+    }
+}
+
+/* Convert CMYK to RGB */
+static void im_psd_cmyk_to_rgb(unsigned char *output, unsigned char **channels,
+                                size_t pixel_count, int bits_per_channel) {
+    if (bits_per_channel == 8) {
+        for (size_t i = 0; i < pixel_count; i++) {
+            float c = channels[0][i] / 255.0f;
+            float m = channels[1][i] / 255.0f;
+            float y = channels[2][i] / 255.0f;
+            float k = channels[3][i] / 255.0f;
+            
+            /* CMYK to RGB conversion */
+            output[i * 3 + 0] = (unsigned char)((1.0f - c) * (1.0f - k) * 255.0f);
+            output[i * 3 + 1] = (unsigned char)((1.0f - m) * (1.0f - k) * 255.0f);
+            output[i * 3 + 2] = (unsigned char)((1.0f - y) * (1.0f - k) * 255.0f);
+        }
+    } else if (bits_per_channel == 16) {
+        for (size_t i = 0; i < pixel_count; i++) {
+            uint16_t c16 = (channels[0][i * 2] << 8) | channels[0][i * 2 + 1];
+            uint16_t m16 = (channels[1][i * 2] << 8) | channels[1][i * 2 + 1];
+            uint16_t y16 = (channels[2][i * 2] << 8) | channels[2][i * 2 + 1];
+            uint16_t k16 = (channels[3][i * 2] << 8) | channels[3][i * 2 + 1];
+            
+            float c = c16 / 65535.0f;
+            float m = m16 / 65535.0f;
+            float y = y16 / 65535.0f;
+            float k = k16 / 65535.0f;
+            
+            output[i * 3 + 0] = (unsigned char)((1.0f - c) * (1.0f - k) * 255.0f);
+            output[i * 3 + 1] = (unsigned char)((1.0f - m) * (1.0f - k) * 255.0f);
+            output[i * 3 + 2] = (unsigned char)((1.0f - y) * (1.0f - k) * 255.0f);
+        }
+    }
+}
+
+float im_clamp_float(float number, float min, float max) {
+    if(number > max) {
+        number = max;
+    } else if (number < min) {
+        number = min;
+    }
+    return number;
+}
+
+/* Convert Lab to RGB */
+static void im_psd_lab_to_rgb(unsigned char *output, unsigned char **channels,
+                               size_t pixel_count, int bits_per_channel) {
+    for (size_t i = 0; i < pixel_count; i++) {
+        float L, a, b;
+        
+        if (bits_per_channel == 8) {
+            /* PSD Lab: L is 0-255 mapped to 0-100, a and b are 0-255 mapped to -128 to 127 */
+            L = (channels[0][i] / 255.0f) * 100.0f;
+            a = channels[1][i] - 128.0f;
+            b = channels[2][i] - 128.0f;
+        } else {
+            uint16_t L16 = (channels[0][i * 2] << 8) | channels[0][i * 2 + 1];
+            uint16_t a16 = (channels[1][i * 2] << 8) | channels[1][i * 2 + 1];
+            uint16_t b16 = (channels[2][i * 2] << 8) | channels[2][i * 2 + 1];
+            
+            L = (L16 / 65535.0f) * 100.0f;
+            a = (a16 / 65535.0f) * 255.0f - 128.0f;
+            b = (b16 / 65535.0f) * 255.0f - 128.0f;
+        }
+        
+        /* Lab to XYZ */
+        float fy = (L + 16.0f) / 116.0f;
+        float fx = a / 500.0f + fy;
+        float fz = fy - b / 200.0f;
+        
+        float x, y, z;
+        float delta = 6.0f / 29.0f;
+        
+        if (fx > delta) x = fx * fx * fx;
+        else x = (fx - 16.0f / 116.0f) * 3.0f * delta * delta;
+        
+        if (fy > delta) y = fy * fy * fy;
+        else y = (fy - 16.0f / 116.0f) * 3.0f * delta * delta;
+        
+        if (fz > delta) z = fz * fz * fz;
+        else z = (fz - 16.0f / 116.0f) * 3.0f * delta * delta;
+        
+        /* D65 white point */
+        x *= 0.95047f;
+        y *= 1.0f;
+        z *= 1.08883f;
+        
+        /* XYZ to sRGB */
+        float r =  3.2404542f * x - 1.5371385f * y - 0.4985314f * z;
+        float g = -0.9692660f * x + 1.8760108f * y + 0.0415560f * z;
+        float bl = 0.0556434f * x - 0.2040259f * y + 1.0572252f * z;
+        
+        /* Clamp and convert to 8-bit */
+        r = im_clamp_float(r, 0, 1);
+        g = im_clamp_float(g, 0, 1);
+        bl = im_clamp_float(bl, 0, 1);
+        
+        output[i * 3 + 0] = (unsigned char)(r * 255.0f);
+        output[i * 3 + 1] = (unsigned char)(g * 255.0f);
+        output[i * 3 + 2] = (unsigned char)(bl * 255.0f);
+    }
+}
 
 unsigned char *im_psd_load(unsigned char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
     unsigned char *at = image_file;
     unsigned char *end_of_file = image_file + file_size;
-    unsigned char *sig = (unsigned char*)consume(&at, end_of_file, 4);
-    IM_INFO("psd_sig: %.*s\n", 4, sig);
+    
+    /* Validate minimum file size */
+    if (file_size < 26) {
+        IM_ERR("PSD file too small to contain valid header");
+        return NULL;
+    }
+    
+    /* ========== FILE HEADER SECTION (26 bytes) ========== */
+    
+    /* Skip signature "8BPS" - already validated */
+    consume(&at, end_of_file, 4);
+    
+    /* Version: 1 = PSD, 2 = PSB (large document) */
+    uint16_t version = consume_and_swap_uint16(&at, end_of_file);
+    if (version != 1 && version != 2) {
+        IM_ERR("Unsupported PSD version: %d", version);
+        return NULL;
+    }
+    
+    /* Skip 6 reserved bytes */
+    consume(&at, end_of_file, 6);
+    
+    /* Number of channels (1-56) */
+    uint16_t channel_count = consume_and_swap_uint16(&at, end_of_file);
+    if (channel_count < 1 || channel_count > 56) {
+        IM_ERR("Invalid PSD channel count: %d", channel_count);
+        return NULL;
+    }
+    
+    /* Image dimensions */
+    uint32_t image_height = consume_and_swap_uint32(&at, end_of_file);
+    uint32_t image_width = consume_and_swap_uint32(&at, end_of_file);
+    
+    /* Validate dimensions */
+    if (image_width == 0 || image_height == 0) {
+        IM_ERR("Invalid PSD dimensions: %dx%d", image_width, image_height);
+        return NULL;
+    }
+    
+    /* For PSD (v1), max is 30000x30000. For PSB (v2), max is 300000x300000 */
+    uint32_t max_dim = (version == 1) ? 30000 : 300000;
+    if (image_width > max_dim || image_height > max_dim) {
+        IM_ERR("PSD dimensions exceed maximum: %dx%d", image_width, image_height);
+        return NULL;
+    }
+    
+    /* Bits per channel: 1, 8, 16, or 32 */
+    uint16_t bits_per_channel = consume_and_swap_uint16(&at, end_of_file);
+    if (bits_per_channel != 1 && bits_per_channel != 8 && 
+        bits_per_channel != 16 && bits_per_channel != 32) {
+        IM_ERR("Unsupported PSD bit depth: %d", bits_per_channel);
+        return NULL;
+    }
+    
+    /* Color mode */
+    uint16_t color_mode = consume_and_swap_uint16(&at, end_of_file);
+    
+    *width = (int)image_width;
+    *height = (int)image_height;
+    
+    /* ========== COLOR MODE DATA SECTION ========== */
+    
+    uint32_t color_data_length = consume_and_swap_uint32(&at, end_of_file);
+    
+    /* Store palette for indexed color mode */
+    unsigned char *palette = NULL;
+    if (color_mode == IM_PSD_COLOR_INDEXED && color_data_length >= 768) {
+        palette = (unsigned char *)malloc(768);
+        if (palette) {
+            im_memcpy(palette, at, 768);
+        }
+    }
+    
+    consume(&at, end_of_file, color_data_length);
+    
+    /* ========== IMAGE RESOURCES SECTION ========== */
+    
+    uint32_t image_resources_length = consume_and_swap_uint32(&at, end_of_file);
+    consume(&at, end_of_file, image_resources_length);
+    
+    /* ========== LAYER AND MASK INFORMATION SECTION ========== */
+    
+    if (version == 1) {
+        uint32_t layer_mask_length = consume_and_swap_uint32(&at, end_of_file);
+        consume(&at, end_of_file, layer_mask_length);
+    } else {
+        /* PSB uses 8-byte length */
+        uint32_t high = consume_and_swap_uint32(&at, end_of_file);
+        uint32_t low = consume_and_swap_uint32(&at, end_of_file);
+        uint64_t layer_mask_length = ((uint64_t)high << 32) | low;
+        consume(&at, end_of_file, (size_t)layer_mask_length);
+    }
+    
+    /* ========== IMAGE DATA SECTION ========== */
+    
+    if (at + 2 > end_of_file) {
+        IM_ERR("PSD file truncated before image data");
+        if (palette) free(palette);
+        return NULL;
+    }
+    
+    uint16_t compression_method = consume_and_swap_uint16(&at, end_of_file);
+    
+    size_t pixel_count = (size_t)image_width * image_height;
+    size_t bytes_per_channel_per_pixel = (bits_per_channel + 7) / 8;
+    size_t channel_size = pixel_count * bytes_per_channel_per_pixel;
+    
+    /* Allocate channel buffers */
+    unsigned char **channel_data = (unsigned char **)malloc(channel_count * sizeof(unsigned char *));
+    if (!channel_data) {
+        if (palette) free(palette);
+        return NULL;
+    }
+    
+    for (int i = 0; i < channel_count; i++) {
+        channel_data[i] = (unsigned char *)malloc(channel_size);
+        if (!channel_data[i]) {
+            for (int j = 0; j < i; j++) free(channel_data[j]);
+            free(channel_data);
+            if (palette) free(palette);
+            return NULL;
+        }
+    }
+    
+    int decode_error = 0;
+    
+    switch (compression_method) {
+        case IM_PSD_COMP_RAW: {
+            /* Raw data: channels stored sequentially in planar format */
+            for (int c = 0; c < channel_count && !decode_error; c++) {
+                if (at + channel_size > end_of_file) {
+                    decode_error = 1;
+                    break;
+                }
+                im_memcpy(channel_data[c], at, channel_size);
+                at += channel_size;
+            }
+            break;
+        }
+        
+        case IM_PSD_COMP_RLE: {
+            /* RLE compressed: row byte counts followed by compressed data */
+            size_t row_count = (size_t)image_height * channel_count;
+            size_t row_count_size = row_count * ((version == 1) ? 2 : 4);
+            
+            if (at + row_count_size > end_of_file) {
+                decode_error = 1;
+                break;
+            }
+            
+            /* Read row byte counts */
+            uint32_t *row_lengths = (uint32_t *)malloc(row_count * sizeof(uint32_t));
+            if (!row_lengths) {
+                decode_error = 1;
+                break;
+            }
+            
+            unsigned char *row_len_ptr = at;
+            for (size_t i = 0; i < row_count; i++) {
+                if (version == 1) {
+                    row_lengths[i] = (row_len_ptr[0] << 8) | row_len_ptr[1];
+                    row_len_ptr += 2;
+                } else {
+                    row_lengths[i] = ((uint32_t)row_len_ptr[0] << 24) |
+                                     ((uint32_t)row_len_ptr[1] << 16) |
+                                     ((uint32_t)row_len_ptr[2] << 8) |
+                                     ((uint32_t)row_len_ptr[3]);
+                    row_len_ptr += 4;
+                }
+            }
+            at += row_count_size;
+            
+            /* Decompress each row using the byte counts */
+            size_t row_idx = 0;
+            size_t bytes_per_row = (size_t)image_width * bytes_per_channel_per_pixel;
+            
+            for (int c = 0; c < channel_count && !decode_error; c++) {
+                for (uint32_t y = 0; y < image_height && !decode_error; y++) {
+                    uint32_t compressed_len = row_lengths[row_idx];
+                    
+                    if (at + compressed_len > end_of_file) {
+                        decode_error = 1;
+                        break;
+                    }
+                    
+                    unsigned char *dst = channel_data[c] + y * bytes_per_row;
+                    unsigned char *src = at;
+                    unsigned char *src_end = at + compressed_len;
+                    
+                    if (im_psd_decode_rle_row(dst, bytes_per_row, &src, src_end) != 0) {
+                        decode_error = 1;
+                    }
+                    
+                    /* Advance by the exact compressed length, not by how much we read */
+                    at += compressed_len;
+                    row_idx++;
+                }
+            }
+            
+            free(row_lengths);
+            break;
+        }
+        
+        case IM_PSD_COMP_ZIP_NO_PREDICTION:
+        case IM_PSD_COMP_ZIP_WITH_PREDICTION: {
+            /* PSD uses raw deflate (no zlib header) 
+             * ZIP-compressed data is stored row-interleaved, not planar */
+            
+            size_t bytes_per_row = (size_t)image_width * bytes_per_channel_per_pixel * channel_count;
+            size_t total_size = bytes_per_row * image_height;
+            
+            unsigned char *all_data = (unsigned char *)malloc(total_size);
+            if (!all_data) {
+                decode_error = 1;
+                break;
+            }
+            
+            /* Decompress all data - raw deflate, no zlib header */
+            size_t compressed_size = (size_t)(end_of_file - at);
+            int64_t result = im_inflate(at, compressed_size, all_data, total_size);
+            
+            if (result < 0 || (size_t)result != total_size) {
+                IM_ERR("PSD ZIP: decompression failed (got %lld, expected %zu)", 
+                       (long long)result, total_size);
+                free(all_data);
+                decode_error = 1;
+                break;
+            }
+            
+            /* Apply delta prediction if needed (applied to raw bytes, row by row) */
+            if (compression_method == IM_PSD_COMP_ZIP_WITH_PREDICTION) {
+                for (uint32_t y = 0; y < image_height; y++) {
+                    unsigned char *row = all_data + y * bytes_per_row;
+                    
+                    if (bits_per_channel == 8) {
+                        for (size_t x = 1; x < bytes_per_row; x++) {
+                            row[x] += row[x - 1];
+                        }
+                    } else if (bits_per_channel == 16) {
+                        for (size_t x = 2; x < bytes_per_row; x += 2) {
+                            uint16_t prev = ((uint16_t)row[x - 2] << 8) | row[x - 1];
+                            uint16_t curr = ((uint16_t)row[x] << 8) | row[x + 1];
+                            uint16_t val = curr + prev;
+                            row[x] = (val >> 8) & 0xFF;
+                            row[x + 1] = val & 0xFF;
+                        }
+                    } else if (bits_per_channel == 32) {
+                        for (size_t x = 4; x < bytes_per_row; x += 4) {
+                            uint32_t prev = ((uint32_t)row[x - 4] << 24) |
+                                           ((uint32_t)row[x - 3] << 16) |
+                                           ((uint32_t)row[x - 2] << 8) |
+                                           ((uint32_t)row[x - 1]);
+                            uint32_t curr = ((uint32_t)row[x] << 24) |
+                                           ((uint32_t)row[x + 1] << 16) |
+                                           ((uint32_t)row[x + 2] << 8) |
+                                           ((uint32_t)row[x + 3]);
+                            uint32_t val = curr + prev;
+                            row[x] = (val >> 24) & 0xFF;
+                            row[x + 1] = (val >> 16) & 0xFF;
+                            row[x + 2] = (val >> 8) & 0xFF;
+                            row[x + 3] = val & 0xFF;
+                        }
+                    }
+                }
+            }
+            
+            /* De-interleave into separate channel buffers */
+            size_t channel_bytes_per_row = (size_t)image_width * bytes_per_channel_per_pixel;
+            for (uint32_t y = 0; y < image_height; y++) {
+                unsigned char *src_row = all_data + y * bytes_per_row;
+                for (int c = 0; c < channel_count; c++) {
+                    unsigned char *dst_row = channel_data[c] + y * channel_bytes_per_row;
+                    for (uint32_t x = 0; x < image_width; x++) {
+                        for (size_t b = 0; b < bytes_per_channel_per_pixel; b++) {
+                            dst_row[x * bytes_per_channel_per_pixel + b] = 
+                                src_row[x * channel_count * bytes_per_channel_per_pixel + 
+                                        c * bytes_per_channel_per_pixel + b];
+                        }
+                    }
+                }
+            }
+            
+            free(all_data);
+            break;
+        }
+        
+        default:
+            IM_ERR("Unknown PSD compression method: %d", compression_method);
+            decode_error = 1;
+            break;
+    }
+    
+    if (decode_error) {
+        for (int i = 0; i < channel_count; i++) {
+            if (channel_data[i]) free(channel_data[i]);
+        }
+        free(channel_data);
+        if (palette) free(palette);
+        return NULL;
+    }
+    
+    /* ========== CONVERT TO OUTPUT FORMAT ========== */
+    
+    unsigned char *output = NULL;
+    int output_channels = 0;
+    
+    switch (color_mode) {
+        case IM_PSD_COLOR_BITMAP: {
+            /* 1-bit bitmap - expand to 8-bit grayscale */
+            output_channels = 1;
+            output = (unsigned char *)malloc(pixel_count);
+            if (output) {
+                for (size_t i = 0; i < pixel_count; i++) {
+                    size_t byte_idx = i / 8;
+                    int bit_idx = 7 - (i % 8);
+                    int bit = (channel_data[0][byte_idx] >> bit_idx) & 1;
+                    output[i] = bit ? 0 : 255; /* 1 = black, 0 = white in PSD */
+                }
+            }
+            break;
+        }
+        
+        case IM_PSD_COLOR_GRAYSCALE: {
+            /* Grayscale, possibly with alpha */
+            output_channels = (channel_count >= 2) ? 2 : 1;
+            output = (unsigned char *)malloc(pixel_count * output_channels);
+            if (output) {
+                if (bits_per_channel == 8) {
+                    im_psd_interleave_channels_8bit(output, channel_data, 
+                                                    output_channels, pixel_count);
+                } else if (bits_per_channel == 16) {
+                    im_psd_interleave_channels_16bit(output, channel_data,
+                                                     output_channels, pixel_count);
+                } else if (bits_per_channel == 32) {
+                    /* 32-bit float - take first byte of big-endian float */
+                    for (size_t i = 0; i < pixel_count; i++) {
+                        for (int c = 0; c < output_channels; c++) {
+                            /* Simplified: just take high byte */
+                            output[i * output_channels + c] = channel_data[c][i * 4];
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        
+        case IM_PSD_COLOR_INDEXED: {
+            /* Indexed color - convert to RGB */
+            output_channels = 3;
+            output = (unsigned char *)malloc(pixel_count * 3);
+            if (output && palette) {
+                for (size_t i = 0; i < pixel_count; i++) {
+                    uint8_t idx = channel_data[0][i];
+                    /* PSD palette is stored as R[256], G[256], B[256] */
+                    output[i * 3 + 0] = palette[idx];
+                    output[i * 3 + 1] = palette[idx + 256];
+                    output[i * 3 + 2] = palette[idx + 512];
+                }
+            }
+            break;
+        }
+        
+        case IM_PSD_COLOR_RGB: {
+            /* RGB, possibly with alpha */
+            output_channels = (channel_count >= 4) ? 4 : 3;
+            output = (unsigned char *)malloc(pixel_count * output_channels);
+            if (output) {
+                if (bits_per_channel == 8) {
+                    im_psd_interleave_channels_8bit(output, channel_data,
+                                                    output_channels, pixel_count);
+                } else if (bits_per_channel == 16) {
+                    im_psd_interleave_channels_16bit(output, channel_data,
+                                                     output_channels, pixel_count);
+                } else if (bits_per_channel == 32) {
+                    /* 32-bit float HDR - simplified conversion */
+                    for (size_t i = 0; i < pixel_count; i++) {
+                        for (int c = 0; c < output_channels; c++) {
+                            /* Read big-endian float, clamp to 0-1, convert to 8-bit */
+                            uint32_t bits = ((uint32_t)channel_data[c][i * 4] << 24) |
+                                           ((uint32_t)channel_data[c][i * 4 + 1] << 16) |
+                                           ((uint32_t)channel_data[c][i * 4 + 2] << 8) |
+                                           ((uint32_t)channel_data[c][i * 4 + 3]);
+                            float f;
+                            im_memcpy(&f, &bits, sizeof(float));
+                            if (f < 0) f = 0;
+                            if (f > 1) f = 1;
+                            output[i * output_channels + c] = (unsigned char)(f * 255.0f);
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        
+        case IM_PSD_COLOR_CMYK: {
+            /* CMYK - convert to RGB */
+            output_channels = 3;
+            output = (unsigned char *)malloc(pixel_count * 3);
+            if (output && channel_count >= 4) {
+                im_psd_cmyk_to_rgb(output, channel_data, pixel_count, bits_per_channel);
+            }
+            break;
+        }
+        
+        case IM_PSD_COLOR_LAB: {
+            /* Lab - convert to RGB */
+            output_channels = 3;
+            output = (unsigned char *)malloc(pixel_count * 3);
+            if (output && channel_count >= 3) {
+                im_psd_lab_to_rgb(output, channel_data, pixel_count, bits_per_channel);
+            }
+            break;
+        }
+        
+        case IM_PSD_COLOR_DUOTONE:
+        case IM_PSD_COLOR_MULTICHANNEL: {
+            /* Treat as grayscale */
+            output_channels = 1;
+            output = (unsigned char *)malloc(pixel_count);
+            if (output) {
+                if (bits_per_channel == 8) {
+                    im_memcpy(output, channel_data[0], pixel_count);
+                } else if (bits_per_channel == 16) {
+                    for (size_t i = 0; i < pixel_count; i++) {
+                        output[i] = channel_data[0][i * 2]; /* High byte */
+                    }
+                }
+            }
+            break;
+        }
+        
+        default:
+            IM_ERR("Unsupported PSD color mode: %d", color_mode);
+            break;
+    }
+    
+    /* Cleanup */
+    for (int i = 0; i < channel_count; i++) {
+        free(channel_data[i]);
+    }
+    free(channel_data);
+    if (palette) free(palette);
+    
+    *num_channels = output_channels;
+    
+    return output;
 }
-
 
 IM_API unsigned char *im_load(const char *image_path, int *width, int *height, int *number_of_channels, int desired_channels) {
 
@@ -2809,3 +3442,5 @@ IM_API unsigned char *im_load(const char *image_path, int *width, int *height, i
 }
 
 #endif // IM_IMPL
+
+
