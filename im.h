@@ -1040,26 +1040,32 @@ void im_png_parse_chunk_IHDR(im_png_info *info) {
 
     switch(info->color_type) {
         case 0:
-            if(info->bits_per_channel !=1 && info->bits_per_channel !=2 && info->bits_per_channel !=4 && info->bits_per_channel !=8 && info->bits_per_channel !=16)
+            if (info->bits_per_channel != 1 && info->bits_per_channel != 2 && info->bits_per_channel != 4 && info->bits_per_channel != 8 && info->bits_per_channel != 16) {
                 IM_ERR("Invalid bit depth for color type 0. Expected 1, 2, 4, 8 or 16, got: %u", info->bits_per_channel);
+            }
             break;
         case 3:
-            if(info->bits_per_channel !=1 && info->bits_per_channel !=2 && info->bits_per_channel !=4 && info->bits_per_channel !=8)
+            if (info->bits_per_channel != 1 && info->bits_per_channel != 2 && info->bits_per_channel != 4 && info->bits_per_channel != 8) {
                 IM_ERR("Invalid bit depth for color type 3. Expected 1, 2, 4 or 8, got: %u", info->bits_per_channel);
+            }
             break;
         case 2:
         case 4:
         case 6:
-            if(info->bits_per_channel != 8 && info->bits_per_channel != 16)
+            if (info->bits_per_channel != 8 && info->bits_per_channel != 16) {
                 IM_ERR("Invalid bit depth for color type 6. Expected 8 or 16, got: %u", info->bits_per_channel);
+            }
             break;
     }
-    if(info->compression_method != 0)
+    if (info->compression_method != 0) {
         IM_ERR("Compression method is supposed to be 0, but it's: %u.", info->compression_method);
-    if(info->filter_method != 0)
+    }
+    if (info->filter_method != 0) {
         IM_ERR("Filter method is supposed to be 0, but it's %u.", info->filter_method);
-    if(info->interlace_method != 0 && info->interlace_method != 1)
+    }
+    if (info->interlace_method != 0 && info->interlace_method != 1) {
         IM_ERR("Interlace method is supposed to be 0 or 1, but it's %u.", info->interlace_method);
+    }
 #endif
 
     IM_INFO("width: %d\n", info->width);
@@ -1266,13 +1272,13 @@ unsigned char* im_png_peek_next_chunk(im_png_info *info, unsigned char *current_
     return current_chunk + PNG_CHUNK_DATA_LEN + PNG_CHUNK_TYPE_LEN + data_length + PNG_CHUNK_CRC_LEN;
 }
 
-
 void im_memset(void *buffer, int value, size_t count) {
     unsigned char *buf = buffer;
     for(size_t i = 0; i < count; i++) {
         buf[i] = value;
     }
 }
+
 typedef struct {
     const uint8_t *data;
     const uint8_t *end;
@@ -1280,39 +1286,39 @@ typedef struct {
     int count;
 } im_bitstream;
 
-static void bs_init(im_bitstream *bs, const uint8_t *data, size_t len) {
+static void im_bs_init(im_bitstream *bs, const uint8_t *data, size_t len) {
     bs->data = data;
     bs->end = data + len;
     bs->bits = 0;
     bs->count = 0;
 }
 
-static void bs_refill(im_bitstream *bs) {
+static void im_bs_refil(im_bitstream *bs) {
     while (bs->count <= 56 && bs->data < bs->end) {
         bs->bits |= (uint64_t)(*bs->data++) << bs->count;
         bs->count += 8;
     }
 }
 
-static uint32_t bs_peek(im_bitstream *bs, int n) {
-    if (bs->count < n) bs_refill(bs);
+static uint32_t im_bs_peek(im_bitstream *bs, int n) {
+    if (bs->count < n) im_bs_refil(bs);
     return bs->bits & ((1ULL << n) - 1);
 }
 
-static void bs_drop(im_bitstream *bs, int n) {
+static void im_bs_drop(im_bitstream *bs, int n) {
     bs->bits >>= n;
     bs->count -= n;
 }
 
-static uint32_t bs_read(im_bitstream *bs, int n) {
-    uint32_t v = bs_peek(bs, n);
-    bs_drop(bs, n);
+static uint32_t im_bs_read(im_bitstream *bs, int n) {
+    uint32_t v = im_bs_peek(bs, n);
+    im_bs_drop(bs, n);
     return v;
 }
 
-static void bs_align(im_bitstream *bs) {
+static void im_bs_align(im_bitstream *bs) {
     int discard = bs->count & 7;
-    if (discard) bs_drop(bs, discard);
+    if (discard) im_bs_drop(bs, discard);
 }
 
 #define HUFF_FAST_BITS 9
@@ -1605,18 +1611,18 @@ static int huff_decode_dynamic(im_bitstream *bs, im_huffman_table *table) {
     
     if (entry != 0 && !(entry & HUFF_SLOW_FLAG)) {
         int len = (entry >> HUFF_LEN_SHIFT) & HUFF_LEN_MASK;
-        bs_drop(bs, len);
+        im_bs_drop(bs, len);
         return entry & HUFF_SYM_MASK;
     }
     
     /* Slow path for long codes */
     for (int len = HUFF_FAST_BITS + 1; len <= table->max_length; len++) {
-        if (bs->count < len) bs_refill(bs);
+        if (bs->count < len) im_bs_refil(bs);
         uint32_t code = bs->bits & ((1u << len) - 1);
         
         for (int i = 0; i < table->slow_count; i++) {
             if (table->slow_len[i] == len && table->slow_code[i] == code) {
-                bs_drop(bs, len);
+                im_bs_drop(bs, len);
                 return table->slow_sym[i];
             }
         }
@@ -1627,26 +1633,26 @@ static int huff_decode_dynamic(im_bitstream *bs, im_huffman_table *table) {
 
 static int64_t im_inflate(const uint8_t *compressed, size_t comp_size, uint8_t *output, size_t output_size) {
     im_bitstream bs;
-    bs_init(&bs, compressed, comp_size);
+    im_bs_init(&bs, compressed, comp_size);
     
     size_t out_pos = 0;
     int bfinal;
     
     do {
-        bfinal = bs_read(&bs, 1);
-        int btype = bs_read(&bs, 2);
+        bfinal = im_bs_read(&bs, 1);
+        int btype = im_bs_read(&bs, 2);
         
         if (btype == 0) {
             /* Uncompressed block */
-            bs_align(&bs);
-            uint16_t len = bs_read(&bs, 16);
-            uint16_t nlen = bs_read(&bs, 16);
+            im_bs_align(&bs);
+            uint16_t len = im_bs_read(&bs, 16);
+            uint16_t nlen = im_bs_read(&bs, 16);
             
             if ((len ^ nlen) != 0xFFFF) return -1;
             
             for (uint16_t i = 0; i < len; i++) {
                 if (out_pos >= output_size) return -1;
-                output[out_pos++] = bs_read(&bs, 8);
+                output[out_pos++] = im_bs_read(&bs, 8);
             }
             
         } else if (btype == 1) {
@@ -1654,11 +1660,11 @@ static int64_t im_inflate(const uint8_t *compressed, size_t comp_size, uint8_t *
              * Fixed Huffman with TWO-SYMBOL-AT-A-TIME optimization
              */
             while (1) {
-                bs_refill(&bs);
+                im_bs_refil(&bs);
                 
                 int sym1, len1;
                 DECODE_FIXED(&bs, im_fixed_lit_table, sym1, len1);
-                bs_drop(&bs, len1);
+                im_bs_drop(&bs, len1);
                 
                 if (sym1 < 256) {
                     /* First symbol is literal - try to decode second */
@@ -1670,14 +1676,14 @@ static int64_t im_inflate(const uint8_t *compressed, size_t comp_size, uint8_t *
                         if (out_pos + 2 > output_size) return -1;
                         output[out_pos++] = (uint8_t)sym1;
                         output[out_pos++] = (uint8_t)sym2;
-                        bs_drop(&bs, len2);
+                        im_bs_drop(&bs, len2);
                         continue;
                     }
                     
                     /* Second is not a literal - write first, process second */
                     if (out_pos >= output_size) return -1;
                     output[out_pos++] = (uint8_t)sym1;
-                    bs_drop(&bs, len2);
+                    im_bs_drop(&bs, len2);
                     sym1 = sym2;
                 } 
                 
@@ -1691,20 +1697,20 @@ static int64_t im_inflate(const uint8_t *compressed, size_t comp_size, uint8_t *
                 
                 int length = im_length_base[len_idx];
                 if (im_length_extra[len_idx] > 0) {
-                    length += bs_read(&bs, im_length_extra[len_idx]);
+                    length += im_bs_read(&bs, im_length_extra[len_idx]);
                 }
                 
                 /* Decode distance */
-                bs_refill(&bs);
+                im_bs_refil(&bs);
                 int dist_sym, dist_len;
                 DECODE_FIXED(&bs, im_fixed_dist_table, dist_sym, dist_len);
-                bs_drop(&bs, dist_len);
+                im_bs_drop(&bs, dist_len);
                 
                 if (dist_sym >= 30) return -1;
                 
                 int distance = im_distance_base[dist_sym];
                 if (im_distance_extra[dist_sym] > 0) {
-                    distance += bs_read(&bs, im_distance_extra[dist_sym]);
+                    distance += im_bs_read(&bs, im_distance_extra[dist_sym]);
                 }
                 
                 if ((size_t)distance > out_pos) return -1;
@@ -1721,9 +1727,9 @@ static int64_t im_inflate(const uint8_t *compressed, size_t comp_size, uint8_t *
             
         } else if (btype == 2) {
             /* Dynamic Huffman - also with two-symbol optimization */
-            int hlit = bs_read(&bs, 5) + 257;
-            int hdist = bs_read(&bs, 5) + 1;
-            int hclen = bs_read(&bs, 4) + 4;
+            int hlit = im_bs_read(&bs, 5) + 257;
+            int hdist = im_bs_read(&bs, 5) + 1;
+            int hclen = im_bs_read(&bs, 4) + 4;
             
             static const int cl_order[19] = {
                 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15
@@ -1731,7 +1737,7 @@ static int64_t im_inflate(const uint8_t *compressed, size_t comp_size, uint8_t *
             
             uint8_t cl_lengths[19] = {0};
             for (int i = 0; i < hclen; i++) {
-                cl_lengths[cl_order[i]] = bs_read(&bs, 3);
+                cl_lengths[cl_order[i]] = im_bs_read(&bs, 3);
             }
             
             im_huffman_table cl_table = {0};
@@ -1742,21 +1748,21 @@ static int64_t im_inflate(const uint8_t *compressed, size_t comp_size, uint8_t *
             int total = hlit + hdist;
             
             while (i < total) {
-                bs_refill(&bs);
+                im_bs_refil(&bs);
                 int sym = huff_decode_dynamic(&bs, &cl_table);
                 if (sym < 0) return -1;
                 
                 if (sym < 16) {
                     lengths[i++] = sym;
                 } else if (sym == 16) {
-                    int repeat = bs_read(&bs, 2) + 3;
+                    int repeat = im_bs_read(&bs, 2) + 3;
                     uint8_t prev = (i > 0) ? lengths[i - 1] : 0;
                     while (repeat-- > 0 && i < total) lengths[i++] = prev;
                 } else if (sym == 17) {
-                    int repeat = bs_read(&bs, 3) + 3;
+                    int repeat = im_bs_read(&bs, 3) + 3;
                     while (repeat-- > 0 && i < total) lengths[i++] = 0;
                 } else if (sym == 18) {
-                    int repeat = bs_read(&bs, 7) + 11;
+                    int repeat = im_bs_read(&bs, 7) + 11;
                     while (repeat-- > 0 && i < total) lengths[i++] = 0;
                 }
             }
@@ -1768,7 +1774,7 @@ static int64_t im_inflate(const uint8_t *compressed, size_t comp_size, uint8_t *
             
             /* Main decode loop with two-symbol optimization */
             while (1) {
-                bs_refill(&bs);
+                im_bs_refil(&bs);
                 
                 int sym1 = huff_decode_dynamic(&bs, &dyn_lit);
                 if (sym1 < 0) return -1;
@@ -1799,16 +1805,16 @@ static int64_t im_inflate(const uint8_t *compressed, size_t comp_size, uint8_t *
                 
                 int length = im_length_base[len_idx];
                 if (im_length_extra[len_idx] > 0) {
-                    length += bs_read(&bs, im_length_extra[len_idx]);
+                    length += im_bs_read(&bs, im_length_extra[len_idx]);
                 }
                 
-                bs_refill(&bs);
+                im_bs_refil(&bs);
                 int dist_sym = huff_decode_dynamic(&bs, &dyn_dist);
                 if (dist_sym < 0 || dist_sym >= 30) return -1;
                 
                 int distance = im_distance_base[dist_sym];
                 if (im_distance_extra[dist_sym] > 0) {
-                    distance += bs_read(&bs, im_distance_extra[dist_sym]);
+                    distance += im_bs_read(&bs, im_distance_extra[dist_sym]);
                 }
                 
                 if ((size_t)distance > out_pos) return -1;
