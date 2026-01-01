@@ -1959,7 +1959,7 @@ unsigned char *im_png_load(unsigned char *image_file, size_t file_size, int *wid
                 skip_chunk(&info);
                 break;
             case CHUNK_PLTE:
-                skip_chunk(&info);
+				im_png_parse_chunk_PLTE(&info);
                 break;
             case CHUNK_bKGD:
                 im_png_parse_chunk_bKGD(&info);
@@ -2014,6 +2014,19 @@ unsigned char *im_png_load(unsigned char *image_file, size_t file_size, int *wid
                 break;
         }
     }
+
+    if (info.color_type == PALETTE && info.png_pixels != NULL) {
+        unsigned char *rgb_pixels = im_png_expand_palette(&info);
+        if (rgb_pixels) {
+            free(info.png_pixels);
+            info.png_pixels = rgb_pixels;
+            *num_channels = 3;  /* Palette images expand to RGB */
+        } else {
+            free(info.png_pixels);
+            return NULL;
+        }
+    }
+    
     return info.png_pixels;
 }
 
