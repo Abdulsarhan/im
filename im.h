@@ -242,6 +242,11 @@ typedef struct{
     uint8_t hour;
     uint8_t minute;
     uint8_t second;
+	
+	/* ADD: palette support */
+    uint8_t palette[256 * 3];  /* RGB palette, up to 256 entries */
+    int palette_size;          /* number of palette entries */
+	
     unsigned char *png_pixels; /* the actual pixels of the image, uncompressed. */
 }im_png_info;
 
@@ -274,7 +279,6 @@ static void im_flip_vertically(unsigned char *data, int width, int height, int c
     
     free(row_buffer);
 }
-
 static int im_cpu_has_sse2 = -1;  /* -1 = not checked, 0 = no, 1 = yes */
 static int im_cpu_has_neon = -1;
 
@@ -916,6 +920,98 @@ typedef struct {
     uint32_t crc;
 }im_png_footer;
 
+void im_png_parse_chunk_PLTE(im_png_info *info) {
+    im_png_chunk_header header = *(im_png_chunk_header*)consume(&info->at, info->end_of_file, sizeof(im_png_chunk_header));
+    endian_swap((uint32_t*)&header);
+
+    /* PLTE length must be divisible by 3 (RGB triplets) */
+    if (header.length % 3 != 0 || header.length > 256 * 3) {
+        IM_ERR("Invalid PLTE chunk length: %u", header.length);
+        consume(&info->at, info->end_of_file, header.length);
+        consume_uint32(&info->at, info->end_of_file);
+        return;
+    }
+
+    info->palette_size = header.length / 3;
+    
+    /* Read palette entries (already in RGB order) */
+    for (int i = 0; i < info->palette_size; i++) {
+        info->palette[i * 3 + 0] = consume_uint8(&info->at, info->end_of_file); /* R */
+        info->palette[i * 3 + 1] = consume_uint8(&info->at, info->end_of_file); /* G */
+        info->palette[i * 3 + 2] = consume_uint8(&info->at, info->end_of_file); /* B */
+    }
+
+    IM_INFO("PLTE chunk: %d palette entries", info->palette_size);
+
+    /* Skip CRC */
+    consume_uint32(&info->at, info->end_of_file);
+}
+static unsigned char *im_png_expand_palette(im_png_info *info) {
+    size_t pixel_count = (size_t)info->width * info->height;
+    unsigned char *rgb_pixels = (unsigned char *)malloc(pixel_count * 3);
+    
+    if (!rgb_pixels) {
+        IM_ERR("Failed to allocate memory for palette expansion");
+        return NULL;
+    }
+    
+    unsigned char *src = info->png_pixels;
+    unsigned char *dst = rgb_pixels;
+    
+    if (info->bits_per_channel == 8) {
+        /* 8-bit palette indices */
+        for (size_t i = 0; i < pixel_count; i++) {
+            uint8_t idx = src[i];
+            if (idx >= info->palette_size) idx = 0;
+            dst[i * 3 + 0] = info->palette[idx * 3 + 0];
+            dst[i * 3 + 1] = info->palette[idx * 3 + 1];
+            dst[i * 3 + 2] = info->palette[idx * 3 + 2];
+        }
+    } else if (info->bits_per_channel == 4) {
+        /* 4-bit palette indices (2 per byte) */
+        size_t src_idx = 0;
+        for (size_t i = 0; i < pixel_count; i++) {
+            uint8_t idx;
+            if (i % 2 == 0) {
+                idx = (src[src_idx] >> 4) & 0x0F;
+            } else {
+                idx = src[src_idx] & 0x0F;
+                src_idx++;
+            }
+            if (idx >= info->palette_size) idx = 0;
+            dst[i * 3 + 0] = info->palette[idx * 3 + 0];
+            dst[i * 3 + 1] = info->palette[idx * 3 + 1];
+            dst[i * 3 + 2] = info->palette[idx * 3 + 2];
+        }
+    } else if (info->bits_per_channel == 2) {
+        /* 2-bit palette indices (4 per byte) */
+        size_t src_idx = 0;
+        for (size_t i = 0; i < pixel_count; i++) {
+            int shift = 6 - (i % 4) * 2;
+            uint8_t idx = (src[src_idx] >> shift) & 0x03;
+            if ((i % 4) == 3) src_idx++;
+            if (idx >= info->palette_size) idx = 0;
+            dst[i * 3 + 0] = info->palette[idx * 3 + 0];
+            dst[i * 3 + 1] = info->palette[idx * 3 + 1];
+            dst[i * 3 + 2] = info->palette[idx * 3 + 2];
+        }
+    } else if (info->bits_per_channel == 1) {
+        /* 1-bit palette indices (8 per byte) */
+        size_t src_idx = 0;
+        for (size_t i = 0; i < pixel_count; i++) {
+            int shift = 7 - (i % 8);
+            uint8_t idx = (src[src_idx] >> shift) & 0x01;
+            if ((i % 8) == 7) src_idx++;
+            if (idx >= info->palette_size) idx = 0;
+            dst[i * 3 + 0] = info->palette[idx * 3 + 0];
+            dst[i * 3 + 1] = info->palette[idx * 3 + 1];
+            dst[i * 3 + 2] = info->palette[idx * 3 + 2];
+        }
+    }
+    
+    return rgb_pixels;
+}
+
 void im_png_parse_chunk_IHDR(im_png_info *info) {
     im_png_chunk_header header = *(im_png_chunk_header*)consume(&info->at, info->end_of_file, sizeof(im_png_chunk_header));
     endian_swap((uint32_t*)&header);
@@ -982,7 +1078,7 @@ void im_png_parse_chunk_IHDR(im_png_info *info) {
             info->channel_count = 4;
             break;
         case PALETTE:
-            info->channel_count = 0;
+            info->channel_count = 1; /* this is technically wrong, but multiply by zero bellow will result in an empty buffer */
             break;
         case GRAYSCALE:
             info->channel_count = 1;
@@ -3421,68 +3517,120 @@ unsigned char *im_psd_load(unsigned char *image_file, size_t file_size, int *wid
     return output;
 }
 
-IM_API unsigned char *im_load(const char *image_path, int *width, int *height, int *number_of_channels, int desired_channels) {
+unsigned char *im_png_load(unsigned char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
 
-    size_t file_size = 0;
-    uint8_t file_sig[8] = {0};
-    unsigned char *image_file = NULL, *pixels = NULL, *at = NULL, *end_of_file = NULL;
-    at = image_file;
-    end_of_file = image_file + file_size;
-    image_file = im__read_entire_file(image_path, &file_size);
+    im_png_info info = {0};
+    info.first_ihdr = im_true;
+    info.png_file = image_file;
+    info.at = image_file;
+    info.palette_size = 0;  /* Initialize palette size */
 
-    if(!image_file) {
-        IM_ERR("ERROR: Failed to read image file from disk.");
-        return NULL;
-    }
+    info.end_of_file = image_file + file_size;
+    unsigned char *png_sig = (unsigned char*)consume(&info.at, info.end_of_file, PNG_SIG_LEN);
 
-    if(!file_size) {
-        IM_ERR("ERROR: size of image file is 0.");
-        return NULL;
-    }
+#ifdef IM_DEBUG
+    im_print_bytes(png_sig, PNG_SIG_LEN);
+#endif
 
+    unsigned char *next_chunk_type = NULL;
+    next_chunk_type = get_next_chunk_type(&info);
+    if(!next_chunk_type) return NULL;
 
-    for(int i = 0; i < 8; i++) {
-        if(at < end_of_file) {
-            im_memcpy(file_sig + i, at++, 1);
-        } else {
-            break;
+    while(*(uint32_t*)next_chunk_type != CHUNK_IEND) {
+        next_chunk_type = get_next_chunk_type(&info);
+        if(!next_chunk_type) return NULL;
+        IM_INFO("chunk: %.*s", 4, next_chunk_type);
+        switch(*(uint32_t*)next_chunk_type)  {
+            case CHUNK_IHDR:
+                im_png_parse_chunk_IHDR(&info);
+                *width = info.width;
+                *height = info.height;
+                *num_channels = info.channel_count;
+                IM_INFO("-----------------------------");
+                break;
+            case CHUNK_cHRM:
+                im_png_parse_chunk_cHRM(&info);
+                IM_INFO("-----------------------------");
+                break;
+            case CHUNK_iCCP:
+                skip_chunk(&info);
+                break;
+            case CHUNK_sBIT:
+                skip_chunk(&info);
+                break;
+            case CHUNK_sRGB:
+                skip_chunk(&info);
+                break;
+            case CHUNK_PLTE:
+                im_png_parse_chunk_PLTE(&info);  /* CHANGED: Parse instead of skip */
+                IM_INFO("-----------------------------");
+                break;
+            case CHUNK_bKGD:
+                im_png_parse_chunk_bKGD(&info);
+                IM_INFO("-----------------------------");
+                break;
+            case CHUNK_hIST:
+                skip_chunk(&info);
+                break;
+            case CHUNK_tRNS:
+                skip_chunk(&info);
+                break;
+            case CHUNK_pHYs:
+                skip_chunk(&info);
+                break;
+            case CHUNK_sPLT:
+                skip_chunk(&info);
+                break;
+            case CHUNK_IDAT: {
+                int idat_chunk_count = 0;
+                unsigned char *err = im_png_decompress(&info, next_chunk_type - PNG_CHUNK_DATA_LEN, &idat_chunk_count);
+                if(!err) return NULL;
+                for(int i = 0; i < idat_chunk_count; i++) {
+                    skip_chunk(&info);
+                }
+                IM_INFO("-----------------------------");
+                break;
+            }
+            case CHUNK_iTXt:
+                skip_chunk(&info);
+                break;
+            case CHUNK_tEXt:
+                im_png_parse_chunk_tEXt(&info);
+                IM_INFO("-----------------------------");
+                break;
+            case CHUNK_zTXt:
+                skip_chunk(&info);
+                break;
+            case CHUNK_tIME:
+                im_png_parse_chunk_tIME(&info);
+                IM_INFO("-----------------------------");
+                break;
+            case CHUNK_gAMA:
+                im_png_parse_chunk_gAMA(&info);
+                IM_INFO("-----------------------------");
+                break;
+            case CHUNK_IEND:
+                im_png_parse_chunk_IEND(&info);
+                IM_INFO("-----------------------------");
+                break;
+            default:
+                skip_chunk(&info);
+                break;
         }
     }
-
-    im_detect_cpu_features();
-
-    if(im_memcmp(im_png_sig, file_sig, PNG_SIG_LEN) == 0) {
-        pixels = im_png_load(image_file, file_size, width, height, number_of_channels, desired_channels);
-    } else if(im_memcmp(file_sig, "BM", 2) == 0) {
-        pixels = im_bmp_load(image_file, file_size, width, height, number_of_channels, desired_channels);
-    } else if(im_memcmp(file_sig, "8BPS", 4) == 0) {
-        pixels = im_psd_load(image_file, file_size, width, height, number_of_channels, desired_channels);
-    } else if(im_memcmp(file_sig, "P1", 2) == 0) {
-        pixels = im_p1_load(image_file, file_size, width, height, number_of_channels, desired_channels);
-    } else if(im_memcmp(file_sig, "P2", 2) == 0) {
-        pixels = im_p2_load(image_file, file_size, width, height, number_of_channels, desired_channels);
-    } else if(im_memcmp(file_sig, "P3", 2) == 0) {
-        pixels = im_p3_load(image_file, file_size, width, height, number_of_channels, desired_channels);
-    } else if(im_memcmp(file_sig, "P4", 2) == 0) {
-        pixels = im_p4_load(image_file, file_size, width, height, number_of_channels, desired_channels);
-    } else if(im_memcmp(file_sig, "P5", 2) == 0) {
-        pixels = im_p5_load(image_file, file_size, width, height, number_of_channels, desired_channels);
-    } else if(im_memcmp(file_sig, "P6", 2) == 0) {
-        pixels = im_p6_load(image_file, file_size, width, height, number_of_channels, desired_channels);
-    } else {
-        IM_ERR("ERROR: File signature does not match any known image formats.\n");
-        free(image_file);
-        return NULL;
-    }
-    /* Free the file buffer */
-    free(image_file);
     
-    /* ADD THIS: Apply vertical flip if enabled */
-    if (pixels && im_flip_vertically_flag) {
-        im_flip_vertically(pixels, *width, *height, *number_of_channels);
+    /* ADDED: Convert palette indices to RGB if paletted image */
+    if (info.color_type == PALETTE && info.png_pixels && info.palette_size > 0) {
+        unsigned char *rgb_pixels = im_png_expand_palette(&info);
+        if (rgb_pixels) {
+            free(info.png_pixels);
+            info.png_pixels = rgb_pixels;
+            info.channel_count = 3;
+            *num_channels = 3;
+        }
     }
     
-    return pixels;
+    return info.png_pixels;
 }
 
 #endif // IM_IMPL
