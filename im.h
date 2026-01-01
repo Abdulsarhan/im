@@ -25,9 +25,15 @@ IM_API void im_set_flip_vertically_on_load(int flag);
 #ifdef IM_IMPLEMENTATION
 #include <stdio.h>
 #include <stdlib.h>
+
+#include <string.h>
 #include <limits.h>
 #include <float.h>
+
+#ifdef __linux
 #include <unistd.h>
+#endif
+
 #include <fcntl.h>
 #include <sys/stat.h>
 
@@ -3418,7 +3424,11 @@ unsigned char *im_psd_load(unsigned char *image_file, size_t file_size, int *wid
 IM_API unsigned char *im_load(const char *image_path, int *width, int *height, int *number_of_channels, int desired_channels) {
 
     size_t file_size = 0;
-    unsigned char *image_file = im__read_entire_file(image_path, &file_size);
+    uint8_t file_sig[8] = {0};
+    unsigned char *image_file = NULL, *pixels = NULL, *at = NULL, *end_of_file = NULL;
+    at = image_file;
+    end_of_file = image_file + file_size;
+    image_file = im__read_entire_file(image_path, &file_size);
 
     if(!image_file) {
         IM_ERR("ERROR: Failed to read image file from disk.");
@@ -3430,9 +3440,6 @@ IM_API unsigned char *im_load(const char *image_path, int *width, int *height, i
         return NULL;
     }
 
-    uint8_t file_sig[8] = {0};
-    unsigned char *at = image_file;
-    unsigned char *end_of_file = image_file + file_size;
 
     for(int i = 0; i < 8; i++) {
         if(at < end_of_file) {
@@ -3445,23 +3452,23 @@ IM_API unsigned char *im_load(const char *image_path, int *width, int *height, i
     im_detect_cpu_features();
 
     if(im_memcmp(im_png_sig, file_sig, PNG_SIG_LEN) == 0) {
-        pixels =  im_png_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+        pixels = im_png_load(image_file, file_size, width, height, number_of_channels, desired_channels);
     } else if(im_memcmp(file_sig, "BM", 2) == 0) {
-        pixels =  im_bmp_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+        pixels = im_bmp_load(image_file, file_size, width, height, number_of_channels, desired_channels);
     } else if(im_memcmp(file_sig, "8BPS", 4) == 0) {
-        pixels =  im_psd_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+        pixels = im_psd_load(image_file, file_size, width, height, number_of_channels, desired_channels);
     } else if(im_memcmp(file_sig, "P1", 2) == 0) {
-        pixels =  im_p1_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+        pixels = im_p1_load(image_file, file_size, width, height, number_of_channels, desired_channels);
     } else if(im_memcmp(file_sig, "P2", 2) == 0) {
-        pixels =  im_p2_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+        pixels = im_p2_load(image_file, file_size, width, height, number_of_channels, desired_channels);
     } else if(im_memcmp(file_sig, "P3", 2) == 0) {
-        pixels =  im_p3_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+        pixels = im_p3_load(image_file, file_size, width, height, number_of_channels, desired_channels);
     } else if(im_memcmp(file_sig, "P4", 2) == 0) {
-        pixels =  im_p4_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+        pixels = im_p4_load(image_file, file_size, width, height, number_of_channels, desired_channels);
     } else if(im_memcmp(file_sig, "P5", 2) == 0) {
-        pixels =  im_p5_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+        pixels = im_p5_load(image_file, file_size, width, height, number_of_channels, desired_channels);
     } else if(im_memcmp(file_sig, "P6", 2) == 0) {
-        pixels =  im_p6_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+        pixels = im_p6_load(image_file, file_size, width, height, number_of_channels, desired_channels);
     } else {
         IM_ERR("ERROR: File signature does not match any known image formats.\n");
         free(image_file);
