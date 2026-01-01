@@ -3517,122 +3517,68 @@ unsigned char *im_psd_load(unsigned char *image_file, size_t file_size, int *wid
     return output;
 }
 
-unsigned char *im_png_load(unsigned char *image_file, size_t file_size, int *width, int *height, int *num_channels, int desired_channels) {
+IM_API unsigned char *im_load(const char *image_path, int *width, int *height, int *number_of_channels, int desired_channels) {
 
-    im_png_info info = {0};
-    info.first_ihdr = im_true;
-    info.png_file = image_file;
-    info.at = image_file;
-    info.palette_size = 0;  /* Initialize palette size */
+    size_t file_size = 0;
+    unsigned char *image_file = im__read_entire_file(image_path, &file_size);
 
-    info.end_of_file = image_file + file_size;
-    unsigned char *png_sig = (unsigned char*)consume(&info.at, info.end_of_file, PNG_SIG_LEN);
+    if(!image_file) {
+        IM_ERR("ERROR: Failed to read image file from disk.");
+        return NULL;
+    }
 
-#ifdef IM_DEBUG
-    im_print_bytes(png_sig, PNG_SIG_LEN);
-#endif
+    if(!file_size) {
+        IM_ERR("ERROR: size of image file is 0.");
+        free(image_file);
+        return NULL;
+    }
 
-    unsigned char *next_chunk_type = NULL;
-    next_chunk_type = get_next_chunk_type(&info);
-    if(!next_chunk_type) return NULL;
+    uint8_t file_sig[8] = {0};
+    unsigned char *at = image_file;
+    unsigned char *end_of_file = image_file + file_size;
 
-    while(*(uint32_t*)next_chunk_type != CHUNK_IEND) {
-        next_chunk_type = get_next_chunk_type(&info);
-        if(!next_chunk_type) return NULL;
-        IM_INFO("chunk: %.*s", 4, next_chunk_type);
-        switch(*(uint32_t*)next_chunk_type)  {
-            case CHUNK_IHDR:
-                im_png_parse_chunk_IHDR(&info);
-                *width = info.width;
-                *height = info.height;
-                *num_channels = info.channel_count;
-                IM_INFO("-----------------------------");
-                break;
-            case CHUNK_cHRM:
-                im_png_parse_chunk_cHRM(&info);
-                IM_INFO("-----------------------------");
-                break;
-            case CHUNK_iCCP:
-                skip_chunk(&info);
-                break;
-            case CHUNK_sBIT:
-                skip_chunk(&info);
-                break;
-            case CHUNK_sRGB:
-                skip_chunk(&info);
-                break;
-            case CHUNK_PLTE:
-                im_png_parse_chunk_PLTE(&info);  /* CHANGED: Parse instead of skip */
-                IM_INFO("-----------------------------");
-                break;
-            case CHUNK_bKGD:
-                im_png_parse_chunk_bKGD(&info);
-                IM_INFO("-----------------------------");
-                break;
-            case CHUNK_hIST:
-                skip_chunk(&info);
-                break;
-            case CHUNK_tRNS:
-                skip_chunk(&info);
-                break;
-            case CHUNK_pHYs:
-                skip_chunk(&info);
-                break;
-            case CHUNK_sPLT:
-                skip_chunk(&info);
-                break;
-            case CHUNK_IDAT: {
-                int idat_chunk_count = 0;
-                unsigned char *err = im_png_decompress(&info, next_chunk_type - PNG_CHUNK_DATA_LEN, &idat_chunk_count);
-                if(!err) return NULL;
-                for(int i = 0; i < idat_chunk_count; i++) {
-                    skip_chunk(&info);
-                }
-                IM_INFO("-----------------------------");
-                break;
-            }
-            case CHUNK_iTXt:
-                skip_chunk(&info);
-                break;
-            case CHUNK_tEXt:
-                im_png_parse_chunk_tEXt(&info);
-                IM_INFO("-----------------------------");
-                break;
-            case CHUNK_zTXt:
-                skip_chunk(&info);
-                break;
-            case CHUNK_tIME:
-                im_png_parse_chunk_tIME(&info);
-                IM_INFO("-----------------------------");
-                break;
-            case CHUNK_gAMA:
-                im_png_parse_chunk_gAMA(&info);
-                IM_INFO("-----------------------------");
-                break;
-            case CHUNK_IEND:
-                im_png_parse_chunk_IEND(&info);
-                IM_INFO("-----------------------------");
-                break;
-            default:
-                skip_chunk(&info);
-                break;
+    for(int i = 0; i < 8; i++) {
+        if(at < end_of_file) {
+            im_memcpy(file_sig + i, at++, 1);
+        } else {
+            break;
         }
     }
-    
-    /* ADDED: Convert palette indices to RGB if paletted image */
-    if (info.color_type == PALETTE && info.png_pixels && info.palette_size > 0) {
-        unsigned char *rgb_pixels = im_png_expand_palette(&info);
-        if (rgb_pixels) {
-            free(info.png_pixels);
-            info.png_pixels = rgb_pixels;
-            info.channel_count = 3;
-            *num_channels = 3;
-        }
+
+    im_detect_cpu_features();
+
+    unsigned char *pixels = NULL;
+
+    if(im_memcmp(im_png_sig, file_sig, PNG_SIG_LEN) == 0) {
+        pixels = im_png_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+    } else if(im_memcmp(file_sig, "BM", 2) == 0) {
+        pixels = im_bmp_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+    } else if(im_memcmp(file_sig, "8BPS", 4) == 0) {
+        pixels = im_psd_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+    } else if(im_memcmp(file_sig, "P1", 2) == 0) {
+        pixels = im_p1_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+    } else if(im_memcmp(file_sig, "P2", 2) == 0) {
+        pixels = im_p2_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+    } else if(im_memcmp(file_sig, "P3", 2) == 0) {
+        pixels = im_p3_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+    } else if(im_memcmp(file_sig, "P4", 2) == 0) {
+        pixels = im_p4_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+    } else if(im_memcmp(file_sig, "P5", 2) == 0) {
+        pixels = im_p5_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+    } else if(im_memcmp(file_sig, "P6", 2) == 0) {
+        pixels = im_p6_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+    } else {
+        IM_ERR("ERROR: File signature does not match any known image formats.\n");
+        free(image_file);
+        return NULL;
     }
-    
-    return info.png_pixels;
+
+    free(image_file);
+
+    if (pixels && im_flip_vertically_flag) {
+        im_flip_vertically(pixels, *width, *height, *number_of_channels);
+    }
+
+    return pixels;
 }
-
 #endif // IM_IMPL
-
-
