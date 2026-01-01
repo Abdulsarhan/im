@@ -14,6 +14,7 @@ extern "C" {
 
 #define IM_API extern
 IM_API unsigned char *im_load(const char *image_path, int *width, int *height, int *number_of_channels, int desired_channels);
+IM_API void im_set_flip_vertically_on_load(int flag);
 
 #ifdef __cplusplus
 }
@@ -239,6 +240,34 @@ typedef struct{
 }im_png_info;
 
 uint8_t im_png_sig[PNG_SIG_LEN] = {137, 80, 78, 71, 13, 10, 26, 10};
+
+static int im_flip_vertically_flag = 0;
+
+IM_API void im_set_flip_vertically_on_load(int flag) {
+    im_flip_vertically_flag = flag;
+}
+
+/* Flip image data vertically (in-place) */
+static void im_flip_vertically(unsigned char *data, int width, int height, int channels) {
+    if (!data || height <= 1) return;
+    
+    size_t row_size = (size_t)width * channels;
+    unsigned char *row_buffer = (unsigned char *)malloc(row_size);
+    if (!row_buffer) return;
+    
+    int half_height = height / 2;
+    for (int y = 0; y < half_height; y++) {
+        unsigned char *top_row = data + (size_t)y * row_size;
+        unsigned char *bottom_row = data + (size_t)(height - 1 - y) * row_size;
+        
+        /* Swap rows */
+        memcpy(row_buffer, top_row, row_size);
+        memcpy(top_row, bottom_row, row_size);
+        memcpy(bottom_row, row_buffer, row_size);
+    }
+    
+    free(row_buffer);
+}
 
 static int im_cpu_has_sse2 = -1;  /* -1 = not checked, 0 = no, 1 = yes */
 static int im_cpu_has_neon = -1;
@@ -3416,29 +3445,37 @@ IM_API unsigned char *im_load(const char *image_path, int *width, int *height, i
     im_detect_cpu_features();
 
     if(im_memcmp(im_png_sig, file_sig, PNG_SIG_LEN) == 0) {
-        return im_png_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+        pixels =  im_png_load(image_file, file_size, width, height, number_of_channels, desired_channels);
     } else if(im_memcmp(file_sig, "BM", 2) == 0) {
-        return im_bmp_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+        pixels =  im_bmp_load(image_file, file_size, width, height, number_of_channels, desired_channels);
     } else if(im_memcmp(file_sig, "8BPS", 4) == 0) {
-        return im_psd_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+        pixels =  im_psd_load(image_file, file_size, width, height, number_of_channels, desired_channels);
     } else if(im_memcmp(file_sig, "P1", 2) == 0) {
-        return im_p1_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+        pixels =  im_p1_load(image_file, file_size, width, height, number_of_channels, desired_channels);
     } else if(im_memcmp(file_sig, "P2", 2) == 0) {
-        return im_p2_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+        pixels =  im_p2_load(image_file, file_size, width, height, number_of_channels, desired_channels);
     } else if(im_memcmp(file_sig, "P3", 2) == 0) {
-        return im_p3_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+        pixels =  im_p3_load(image_file, file_size, width, height, number_of_channels, desired_channels);
     } else if(im_memcmp(file_sig, "P4", 2) == 0) {
-        return im_p4_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+        pixels =  im_p4_load(image_file, file_size, width, height, number_of_channels, desired_channels);
     } else if(im_memcmp(file_sig, "P5", 2) == 0) {
-        return im_p5_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+        pixels =  im_p5_load(image_file, file_size, width, height, number_of_channels, desired_channels);
     } else if(im_memcmp(file_sig, "P6", 2) == 0) {
-        return im_p6_load(image_file, file_size, width, height, number_of_channels, desired_channels);
+        pixels =  im_p6_load(image_file, file_size, width, height, number_of_channels, desired_channels);
     } else {
+        IM_ERR("ERROR: File signature does not match any known image formats.\n");
+        free(image_file);
         return NULL;
     }
-
-    IM_ERR("ERROR: File signature does not match any known image formats.\n");
-    return NULL;
+    /* Free the file buffer */
+    free(image_file);
+    
+    /* ADD THIS: Apply vertical flip if enabled */
+    if (pixels && im_flip_vertically_flag) {
+        im_flip_vertically(pixels, *width, *height, *number_of_channels);
+    }
+    
+    return pixels;
 }
 
 #endif // IM_IMPL
