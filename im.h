@@ -30,7 +30,9 @@ IM_API void im_set_flip_vertically_on_load(int flag);
 #include <limits.h>
 #include <float.h>
 
-#ifdef __linux
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <unistd.h>
 #endif
 
@@ -730,6 +732,24 @@ int im_memcmp(const void *a, const void *b, size_t n) {
 
     return 0;
 }
+
+#ifdef _WIN32
+static wchar_t* win32_utf8_to_utf16(const char* utf8_str) {
+    int len = MultiByteToWideChar(CP_UTF8, 0, utf8_str, -1, NULL, 0);
+    wchar_t* utf16_str = (wchar_t*)malloc(len * sizeof(wchar_t));
+
+    if (!utf8_str) return NULL;
+    if (len == 0) return NULL;
+    if (!utf16_str) return NULL;
+    
+    if (MultiByteToWideChar(CP_UTF8, 0, utf8_str, -1, utf16_str, len) == 0) {
+        free(utf16_str);
+        return NULL;
+    }
+    
+    return utf16_str;
+}
+#endif
 
 unsigned char *im__read_entire_file(const char *file_path, size_t *bytes_read) {
 #ifdef _WIN32
