@@ -763,7 +763,7 @@ unsigned char *im__read_entire_file(const char *file_path, size_t *bytes_read) {
         return NULL;
     }
 
-    if (file_size.QuadPart > SIZE_MAX) {
+    if (file_size.QuadPart > LLONG_MAX) {
         CloseHandle(file);
         return NULL;
     }
